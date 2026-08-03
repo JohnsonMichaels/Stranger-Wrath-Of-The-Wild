@@ -193,6 +193,15 @@ static xbox::dword_xt                   g_Xbox_BaseVertexIndex = 0; // Set by D3
 static xbox::dword_xt                  *g_pXbox_BeginPush_Buffer = xbox::zeroptr; // primary push buffer
 
        xbox::X_PixelShader*			g_pXbox_PixelShader = xbox::zeroptr;
+
+// Render-progress counters - see Direct3D9.h
+       unsigned                     g_RenderStat_Swaps = 0;
+       unsigned                     g_RenderStat_HostDraws = 0;
+       unsigned                     g_RenderStat_VertexShaderLookups = 0;
+       unsigned                     g_RenderStat_VertexShaderMissing = 0;
+       unsigned                     g_RenderStat_VertexShaderFromDevice = 0;
+       unsigned                     g_RenderStat_NullTextureStages = 0;
+#define RENDERSTATS_SWAP_INTERVAL 60
 static xbox::PVOID                   g_pXbox_Palette_Data[xbox::X_D3DTS_STAGECOUNT] = { xbox::zeroptr, xbox::zeroptr, xbox::zeroptr, xbox::zeroptr }; // cached palette pointer
 static unsigned                     g_Xbox_Palette_Size[xbox::X_D3DTS_STAGECOUNT] = { 0 }; // cached palette size
 
@@ -244,6 +253,7 @@ static LRESULT WINAPI               EmuMsgProc(HWND hWnd, UINT msg, WPARAM wPara
 static inline void                  EmuVerifyResourceIsRegistered(xbox::X_D3DResource *pResource, DWORD D3DUsage, int iTextureStage, DWORD dwSize);
 static void							UpdateCurrentMSpFAndFPS(); // Used for benchmarking/fps count
 static void							CxbxImpl_SetRenderTarget(xbox::X_D3DSurface *pRenderTarget, xbox::X_D3DSurface *pNewZStencil);
+static void							CxbxrImpl_CatchUpXboxFence(); // Marks every Xbox GPU fence handed out so far as passed
 
 #define CXBX_D3DCOMMON_IDENTIFYING_MASK (X_D3DCOMMON_TYPE_MASK | X_D3DCOMMON_D3DCREATED)
 
@@ -4053,7 +4063,18 @@ xbox::X_D3DSurface* CxbxrImpl_GetBackBuffer2
 	// We get signatures for both backbuffer functions as it changed in later XDKs
 
 	// This also updates the reference count, so we don't need to do this ourselves
-	if (XB_TRMP(D3DDevice_GetBackBuffer) != nullptr) {
+	//
+	// GetBackBuffer2 MUST be tried first. On some titles the Xbox GetBackBuffer is a
+	// thin wrapper that simply tail-calls GetBackBuffer2 - and since Cxbx patches BOTH,
+	// running the GetBackBuffer trampoline re-enters the patched GetBackBuffer2, which
+	// lands back here. That recursion consumes ~680 bytes of stack per cycle and blows
+	// the 1 MB emulation stack (STATUS_STACK_OVERFLOW). Calling the GetBackBuffer2
+	// trampoline goes straight to the code that does the real work, with no patched
+	// call site in between.
+	if (XB_TRMP(D3DDevice_GetBackBuffer2) != nullptr) {
+		pXboxBackBuffer = XB_TRMP(D3DDevice_GetBackBuffer2)(BackBuffer);
+	}
+	else if (XB_TRMP(D3DDevice_GetBackBuffer) != nullptr) {
 		XB_TRMP(D3DDevice_GetBackBuffer)(BackBuffer, D3DBACKBUFFER_TYPE_MONO, &pXboxBackBuffer);
 	}
 	else if (XB_TRMP(D3DDevice_GetBackBuffer_8__LTCG_eax1) != nullptr) {
@@ -5383,6 +5404,19 @@ xbox::dword_xt WINAPI xbox::EMUPATCH(D3DDevice_Swap)
 {
 	LOG_FUNC_ONE_ARG(Flags);
 	PerfTrace_OnSwapBegin(); // prints previous frame, resets accumulators, starts swap timer
+
+	if ((++g_RenderStat_Swaps % RENDERSTATS_SWAP_INTERVAL) == 0) {
+		printf("RENDERSTATS: swaps=%u hostDraws=%u vertexShaderLookups=%u fromDevice=%u missing=%u nullTexStages=%u\n",
+			g_RenderStat_Swaps, g_RenderStat_HostDraws,
+			g_RenderStat_VertexShaderLookups, g_RenderStat_VertexShaderFromDevice,
+			g_RenderStat_VertexShaderMissing, g_RenderStat_NullTextureStages);
+	}
+
+	// Everything submitted for this frame has already been drawn synchronously on
+	// the host, so let the title's (unpatched) fence checks see a caught-up GPU.
+	// Xbox D3D code we don't patch can stamp resources with the current fence,
+	// and without this they'd stay "busy" until the next patched fence call.
+	CxbxrImpl_CatchUpXboxFence();
 
 	// Handle swap flags
 	// We don't maintain a swap chain, and draw everything to backbuffer 0
@@ -7807,10 +7841,19 @@ void CxbxDrawIndexedClosingLineUP(INDEX16 LowIndex, INDEX16 HighIndex, void *pHo
 
 // Requires assigned pXboxIndexData
 // Called by D3DDevice_DrawIndexedVertices and EmuExecutePushBufferRaw (twice)
+// Set by CxbxUpdateHostVertexDeclaration when no usable declaration exists.
+// Submitting a draw in that state faults inside d3d9.dll rather than returning
+// an error, so the draw is dropped instead. Declared in XbVertexShader.cpp.
+extern bool g_Cxbx_SkipDrawNoVertexDeclaration;
+
 void CxbxDrawIndexed(CxbxDrawContext &DrawContext)
 {
 	LOG_INIT // Allows use of DEBUG_D3DRESULT
 	PERF_SCOPE(PERF_CAT_DRAW);
+
+	if (g_Cxbx_SkipDrawNoVertexDeclaration) return;
+
+	g_RenderStat_HostDraws++;
 
 	assert(DrawContext.dwStartVertex == 0);
 	assert(DrawContext.pXboxIndexData != nullptr);
@@ -7825,6 +7868,13 @@ void CxbxDrawIndexed(CxbxDrawContext &DrawContext)
 	DrawContext.HighIndex = CacheEntry.HighIndex;
 
 	VertexBufferConverter.Apply(&DrawContext); // Sets dwHostPrimitiveCount
+
+	if (CxbxDrawHasUnboundStream()) {
+		// The active declaration references a stream with no vertex buffer behind it.
+		// Host D3D9 faults on that rather than rejecting it - see CxbxDrawHasUnboundStream.
+		LOG_TEST_CASE("Skipping draw with an unbound vertex stream");
+		return;
+	}
 
 	INT BaseVertexIndex = DrawContext.dwBaseVertexIndex;
 	UINT primCount = DrawContext.dwHostPrimitiveCount;
@@ -7884,12 +7934,22 @@ void CxbxDrawPrimitiveUP(CxbxDrawContext &DrawContext)
 	LOG_INIT // Allows use of DEBUG_D3DRESULT
 	PERF_SCOPE(PERF_CAT_DRAW);
 
+	if (g_Cxbx_SkipDrawNoVertexDeclaration) return;
+	g_RenderStat_HostDraws++;
+
 	assert(DrawContext.dwStartVertex == 0);
 	assert(DrawContext.pXboxVertexStreamZeroData != xbox::zeroptr);
 	assert(DrawContext.uiXboxVertexStreamZeroStride > 0);
 	assert(DrawContext.dwBaseVertexIndex == 0); // No IndexBase under Draw*UP
 
 	VertexBufferConverter.Apply(&DrawContext);
+
+	if (CxbxDrawHasUnboundStream()) {
+		// The active declaration references a stream with no vertex buffer behind it.
+		// Host D3D9 faults on that rather than rejecting it - see CxbxDrawHasUnboundStream.
+		LOG_TEST_CASE("Skipping draw with an unbound vertex stream");
+		return;
+	}
 	if (DrawContext.XboxPrimitiveType == xbox::X_D3DPT_QUADLIST) {
 		// LOG_TEST_CASE("X_D3DPT_QUADLIST"); // test-case : X-Marbles and XDK Sample PlayField
 		// Draw quadlists using a single 'quad-to-triangle mapping' index buffer :
@@ -7958,6 +8018,45 @@ IDirect3DBaseTexture* CxbxConvertXboxSurfaceToHostTexture(xbox::X_D3DBaseTexture
 	return pNewHostBaseTexture;
 }
 
+// A 1x1 opaque white texture, used to fill texture stages that a pixel shader samples but
+// the title left empty - see the comment at the substitution site in CxbxUpdateHostTextures.
+// Created on demand and re-created if the host device is replaced (Reset recreates it).
+static IDirect3DTexture9 *g_pCxbxDummyTexture = nullptr;
+static IDirect3DDevice9Ex *g_pCxbxDummyTextureDevice = nullptr;
+
+static IDirect3DBaseTexture *CxbxrGetDummyTexture()
+{
+	if (g_pCxbxDummyTexture != nullptr && g_pCxbxDummyTextureDevice == g_pD3DDevice) {
+		return g_pCxbxDummyTexture;
+	}
+
+	if (g_pCxbxDummyTexture != nullptr) {
+		g_pCxbxDummyTexture->Release();
+		g_pCxbxDummyTexture = nullptr;
+	}
+
+	if (g_pD3DDevice == nullptr) {
+		return nullptr;
+	}
+
+	IDirect3DTexture9 *pTexture = nullptr;
+	if (FAILED(g_pD3DDevice->CreateTexture(1, 1, 1, /*Usage=*/0, D3DFMT_A8R8G8B8,
+			D3DPOOL_MANAGED, &pTexture, nullptr)) || pTexture == nullptr) {
+		EmuLog(LOG_LEVEL::WARNING, "Could not create the placeholder texture for empty stages");
+		return nullptr;
+	}
+
+	D3DLOCKED_RECT LockedRect = {};
+	if (SUCCEEDED(pTexture->LockRect(0, &LockedRect, nullptr, 0))) {
+		*(uint32_t *)LockedRect.pBits = 0xFFFFFFFF; // opaque white
+		pTexture->UnlockRect(0);
+	}
+
+	g_pCxbxDummyTexture = pTexture;
+	g_pCxbxDummyTextureDevice = g_pD3DDevice;
+	return g_pCxbxDummyTexture;
+}
+
 void CxbxUpdateHostTextures()
 {
 	PERF_SCOPE(PERF_CAT_UPDATE_TEXTURES);
@@ -8009,6 +8108,24 @@ void CxbxUpdateHostTextures()
 			auto it = ResourceCache.find(key);
 			if (it != ResourceCache.end()) {
 				g_HostTextureFormats[stage] = it->second.HostFormat;
+			}
+		}
+
+		// A texture stage left empty is legal under the fixed-function pipeline, but NOT when
+		// a pixel shader is active: the retail D3D9 runtime does not check whether a stage a
+		// shader samples actually has a texture, it dereferences the texture object during the
+		// draw and faults. That is an access violation reading 0x00000024 with ECX = 0, three
+		// frames inside d3d9, reached from the DrawIndexedPrimitive vtable call in
+		// CxbxDrawIndexed - which is exactly the crash seen in Oddworld: Stranger's Wrath
+		// (2004-05-22 Final), and exactly why setting DisablePixelShaders made it go away.
+		//
+		// Substituting a 1x1 opaque white texture keeps the draw alive and renders the surface
+		// untextured instead of killing the title. Only done while a pixel shader is bound, so
+		// fixed-function drawing keeps its existing (correct, null-tolerant) behaviour.
+		if (pHostBaseTexture == nullptr && g_pXbox_PixelShader != xbox::zeroptr) {
+			g_RenderStat_NullTextureStages++;
+			if (IDirect3DBaseTexture *pDummy = CxbxrGetDummyTexture()) {
+				pHostBaseTexture = pDummy;
 			}
 		}
 
@@ -8472,7 +8589,37 @@ xbox::void_xt CxbxImpl_SetPixelShader(xbox::dword_xt Handle)
 	// By writing to render state during this patch, we avoid missing out on updates that push buffer commands would perform.
 	// However, any updates that occur mid-way can overwrite what we store here, and still cause problems!
 	// The only viable solution for that would be to draw entirely based on push-buffer handling (which might require removing possibly all D3D patches!)
-    if (g_pXbox_PixelShader != nullptr) {
+    // Note : pPSDef must be checked separately from the X_PixelShader itself. A title can hand us a
+    // live X_PixelShader whose pPSDef is null (observed in Oddworld: Stranger's Wrath, May 2004 build,
+    // while streaming level geometry - it crashed here on a 228-byte memcpy from a null source).
+    // The Xbox's own D3DDevice_SetPixelShader ran via XB_TRMP just above without faulting, which proves
+    // the XDK tolerates this case - so this patch has to as well. The trampoline has already updated the
+    // real D3D__RenderState, and the copy below is only the redundant mirror described in the comment
+    // above, so skipping it is safe.
+    // Note : a null check on pPSDef is not enough. If the symbol scanner ever points this
+    // patch at the wrong function, Handle is not an X_PixelShader* at all and pPSDef is read
+    // out of the middle of whatever it does point at - which yields a non-null pointer to
+    // nowhere, and the 228-byte read below then access-violates. That is exactly what
+    // happened when D3DDevice_SetPixelShader resolved to D3DDevice_SetPixelShaderProgram in
+    // the D3D8LTCG 5849 database (Stranger's Wrath, 2004-05-22 Final): pPSDef came back as
+    // 0xD9D430DD and the memcpy died. Validate that both structs are actually mapped before
+    // reading them, so a bad symbol degrades to a logged skip instead of killing the title.
+    if (g_pXbox_PixelShader != nullptr
+        && !g_VMManager.IsValidVirtualAddress((VAddr)g_pXbox_PixelShader)) {
+        LOG_TEST_CASE("SetPixelShader handle is not a mapped address - ignoring");
+        g_pXbox_PixelShader = xbox::zeroptr;
+    }
+
+    if (g_pXbox_PixelShader != nullptr
+        && g_pXbox_PixelShader->pPSDef != nullptr
+        && !g_VMManager.IsValidVirtualAddress((VAddr)g_pXbox_PixelShader->pPSDef)) {
+        // Do not clear g_pXbox_PixelShader here - the title's own SetPixelShader accepted this
+        // handle, so it is a real shader; only our reading of pPSDef is suspect.
+        LOG_TEST_CASE("SetPixelShader pPSDef is not a mapped address - skipping render state mirror");
+        return;
+    }
+
+    if (g_pXbox_PixelShader != nullptr && g_pXbox_PixelShader->pPSDef != nullptr) {
         // TODO : If D3DDevice_SetPixelShader() in XDKs don't overwrite the X_D3DRS_PS_RESERVED slot with PSDef.PSTextureModes,
         // store it here and restore after memcpy, or alternatively, perform two separate memcpy's (the halves before, and after the reserved slot).
         memcpy(XboxRenderStates.GetPixelShaderRenderStatePointer(), g_pXbox_PixelShader->pPSDef, sizeof(xbox::X_D3DPIXELSHADERDEF) - 3 * sizeof(DWORD));
@@ -9613,18 +9760,308 @@ xbox::hresult_xt WINAPI xbox::EMUPATCH(D3DDevice_SetDepthClipPlanes)
 }
 
 // ******************************************************************
+// * Xbox GPU fence emulation
+// ******************************************************************
+//
+// On the Xbox, the NV2A runs asynchronously behind the CPU. Direct3D hands
+// out monotonically increasing "fence" values and the GPU writes the value of
+// the last fence it passed into a DWORD in shared memory, which lets titles
+// tell whether the GPU is still reading a resource. Two fields of the Xbox
+// D3D device drive all of this:
+//
+//    D3D__Device.m_Fence       : the next fence value the CPU will hand out
+//    *D3D__Device.m_pGpuFence  : the last fence value the GPU actually passed
+//
+// The Xbox D3D library implements the fence API purely in terms of those two
+// (disassembled from the XDK D3D8 library shipped inside the title):
+//
+//    D3D::SetFence(Flags)      -> returns m_Fence, then m_Fence += 2
+//    D3DDevice_InsertFence()   -> D3D::SetFence(0)
+//    D3DDevice_IsFencePending(F)
+//                              -> (m_Fence - F) < (m_Fence - *m_pGpuFence)
+//    D3DResource_IsBusy(pRes)  -> pRes->Lock != 0 &&
+//                                 (m_Fence - pRes->Lock) < (m_Fence - *m_pGpuFence)
+//
+// Fence values are always ODD and step by two - D3D::SetFence asserts
+// (m_Fence & 1) != 0 - so this code mimics that exactly.
+//
+// Cxbx-Reloaded translates every draw into a synchronous host Direct3D9 call,
+// so from the title's point of view the GPU is always fully caught up and any
+// fence can be reported as passed the instant it is inserted.
+//
+// The important part is that it is NOT enough to fake the return values of the
+// patched functions: D3DResource_IsBusy (reached through the inline
+// IDirect3DResource8::IsBusy() wrapper) is not patched at all, and reads the
+// two fields above straight out of the title's own device structure. If
+// *m_pGpuFence never advances, every resource whose Lock is non-zero stays
+// busy forever.
+//
+// Test case: Oddworld: Stranger's Wrath (2004 beta). Its renderer inserts a
+// fence, spins waiting for a resource to stop being busy, gives up after four
+// seconds with "Timed out while attempting to clear resource! (VERY BAD!)" and
+// asserts pResource->IsBusy() == FALSE in engine\renderer\device.cpp.
+//
+// So instead of returning a dummy value, keep the title's real fence fields
+// consistent: advance m_Fence when the title inserts a fence, and pin the
+// GPU-side fence to it so that everything ever issued reads back as complete.
+
+// Offsets into the Xbox D3D device structure (the one D3D_g_pDevice points at)
+// of the two fields described above. These were confirmed by disassembling
+// D3DDevice_IsFencePending / D3DResource_IsBusy in the title's own copy of the
+// XDK D3D8 library; CxbxrLocateXboxFence() below validates them at runtime and
+// backs off if they don't look right, so a differing XDK degrades to the old
+// (do-nothing) behaviour rather than corrupting the device structure.
+#define XBOX_D3DDEVICE_OFFSET_Fence     0x2C
+#define XBOX_D3DDEVICE_OFFSET_pGpuFence 0x30
+
+// Reads the vertex shader the title itself has selected, straight out of the Xbox D3D
+// device structure, instead of trusting the g_Xbox_VertexShader_Handle shadow variable
+// that only our own patches maintain.
+//
+// That shadow variable is written by CxbxImpl_SetVertexShader and CxbxImpl_SelectVertexShader,
+// and the latter writes it only "if (Handle)" - so a SelectVertexShader(0, Address) call, which
+// is the normal way to re-point an already selected shader at a different program slot, leaves
+// it stale or zero. That produced "Unassigned Xbox vertex shader!" once per frame in Oddworld:
+// Stranger's Wrath (2004-05-22 Final), after which GetXboxVertexAttributeFormat fell back to
+// g_Xbox_SetVertexShaderInput_Attributes - its own comment calls that a WRONG result - and the
+// bad declaration that produced killed the host D3D9 runtime inside CxbxDrawIndexed.
+//
+// The device field is authoritative. Disassembling the title's own XDK copy shows both writers
+// agreeing on the layout:
+//   D3DDevice_SelectVertexShader (0x00209580): lea edi,[eax-1]      ; Handle & ~1
+//                                              mov [esi+0x794],edi  ; the shader POINTER
+//                                              mov [esi+0x798],eax  ; the handle
+//   D3DDevice_SetVertexShader    (0x00209D90): mov edi,0x00218D00   ; internal FVF shader
+//                                              mov [esi+0x794],edi
+//                                              mov [esi+0x798],ebx  ; the FVF
+// so the field always holds a usable X_D3DVertexShader*, including for FVF draws - which is
+// exactly what GetXboxVertexShader needs, and is why the FVF path needs no special case here.
+//
+// 0x794 is not hard-coded: it is the D3DDevice__m_VertexShader_OFFSET symbol, and the value the
+// scanner supplies for this title matches the disassembly above.
+//
+// Cxbx's X_D3DVertexShader layout was cross-checked against the same code before turning this
+// on: D3DDevice_LoadVertexShader reads its DWORD count from [shader+0x0C]
+// (ProgramAndConstantsDwords) and the program itself from [shader+0x114] - and 0x114 is exactly
+// where ProgramAndConstants lands given Dimensionality at +0x10 followed by a 16-slot,
+// 16-bytes-per-slot X_VERTEXATTRIBUTEFORMAT at +0x14.
+static xbox::X_D3DVertexShader **g_ppXbox_VertexShader = nullptr;
+static bool                      g_bXbox_VertexShaderFieldUnavailable = false;
+
+xbox::X_D3DVertexShader *CxbxrGetXboxCurrentVertexShader()
+{
+	if (g_ppXbox_VertexShader == nullptr) {
+		if (g_bXbox_VertexShaderFieldUnavailable) {
+			return nullptr;
+		}
+
+		auto itDevice = g_SymbolAddresses.find("D3D_g_pDevice");
+		auto itOffset = g_SymbolAddresses.find("D3DDevice__m_VertexShader_OFFSET");
+		if (itDevice == g_SymbolAddresses.end() || itDevice->second == 0
+		 || itOffset == g_SymbolAddresses.end() || itOffset->second == 0) {
+			EmuLog(LOG_LEVEL::WARNING, "D3D_g_pDevice / D3DDevice__m_VertexShader_OFFSET not found -"
+				" falling back to the SetVertexShader/SelectVertexShader shadow variable");
+			g_bXbox_VertexShaderFieldUnavailable = true;
+			return nullptr;
+		}
+
+		// D3D_g_pDevice is a pointer *to* the device structure, not the structure itself
+		uint8_t *pXboxDevice = *(uint8_t **)(itDevice->second);
+		if (pXboxDevice == nullptr) {
+			return nullptr; // Xbox CreateDevice hasn't run yet - try again on the next call
+		}
+
+		auto ppXboxVertexShader = (xbox::X_D3DVertexShader **)(pXboxDevice + itOffset->second);
+		if (!g_VMManager.IsValidVirtualAddress((VAddr)ppXboxVertexShader)) {
+			EmuLog(LOG_LEVEL::WARNING, "Xbox device vertex shader field at 0x%08X is not mapped -"
+				" falling back to the SetVertexShader/SelectVertexShader shadow variable",
+				(uint32_t)(uintptr_t)ppXboxVertexShader);
+			g_bXbox_VertexShaderFieldUnavailable = true;
+			return nullptr;
+		}
+
+		EmuLog(LOG_LEVEL::INFO, "Xbox current vertex shader field located at 0x%08X"
+			" (D3D__Device 0x%08X + 0x%X)",
+			(uint32_t)(uintptr_t)ppXboxVertexShader, (uint32_t)(uintptr_t)pXboxDevice, itOffset->second);
+
+		g_ppXbox_VertexShader = ppXboxVertexShader;
+	}
+
+	xbox::X_D3DVertexShader *pXboxVertexShader = *g_ppXbox_VertexShader;
+	if (pXboxVertexShader == xbox::zeroptr
+	 || !g_VMManager.IsValidVirtualAddress((VAddr)pXboxVertexShader)) {
+		return nullptr; // Let the caller fall back
+	}
+
+	return pXboxVertexShader;
+}
+
+static xbox::dword_xt *g_pXbox_Fence = nullptr;    // &D3D__Device.m_Fence
+static xbox::dword_xt *g_pXbox_GpuFence = nullptr; // the DWORD the GPU writes into
+static bool            g_bXbox_FenceUnavailable = false;
+
+// Locates the fence fields inside the Xbox D3D device structure.
+// Returns false when they are not (yet) available - the Xbox Direct3D_CreateDevice
+// trampoline must have run before D3D_g_pDevice holds anything useful.
+static bool CxbxrLocateXboxFence()
+{
+	if (g_pXbox_Fence != nullptr) {
+		return true;
+	}
+
+	if (g_bXbox_FenceUnavailable) {
+		return false;
+	}
+
+	auto it = g_SymbolAddresses.find("D3D_g_pDevice");
+	if (it == g_SymbolAddresses.end() || it->second == 0) {
+		EmuLog(LOG_LEVEL::WARNING, "D3D_g_pDevice was not found - Xbox GPU fences cannot be emulated");
+		g_bXbox_FenceUnavailable = true;
+		return false;
+	}
+
+	// D3D_g_pDevice is a pointer *to* the device structure, not the structure itself
+	uint8_t *pXboxDevice = *(uint8_t **)(it->second);
+	if (pXboxDevice == nullptr) {
+		return false; // Xbox CreateDevice hasn't run yet - try again on the next call
+	}
+
+	xbox::dword_xt *pFence = (xbox::dword_xt *)(pXboxDevice + XBOX_D3DDEVICE_OFFSET_Fence);
+	xbox::dword_xt *pGpuFence = *(xbox::dword_xt **)(pXboxDevice + XBOX_D3DDEVICE_OFFSET_pGpuFence);
+
+	// Validate the assumed layout before writing anything into the title's device:
+	// fence values are always odd, and the GPU-side fence must live at a mapped address.
+	if (((*pFence) & 1) == 0
+	 || pGpuFence == nullptr
+	 || !g_VMManager.IsValidVirtualAddress((VAddr)pGpuFence)) {
+		EmuLog(LOG_LEVEL::WARNING, "Xbox D3D device fence fields not recognised (m_Fence=0x%08X, m_pGpuFence=0x%08X)"
+			" - GPU fences will not be emulated", *pFence, (uint32_t)pGpuFence);
+		g_bXbox_FenceUnavailable = true;
+		return false;
+	}
+
+	g_pXbox_Fence = pFence;
+	g_pXbox_GpuFence = pGpuFence;
+
+	EmuLog(LOG_LEVEL::INFO, "Xbox GPU fence located: D3D__Device=0x%08X m_Fence=0x%08X (=%u) m_pGpuFence=0x%08X (*=0x%08X)",
+		(uint32_t)pXboxDevice, *g_pXbox_Fence, *g_pXbox_Fence, (uint32_t)g_pXbox_GpuFence, *g_pXbox_GpuFence);
+
+	// The same structure carries the GPU FIFO pointers, at +0x00 (current push
+	// pointer), +0x24 (buffer start) and +0x28 (buffer end). Titles read these
+	// directly - Stranger's Wrath does so through Renderer::GetPushBufferStart/
+	// EndAddress and asserts four invariants on them in Renderer::AppInit:
+	// start is 1 KB aligned, start >= 0x80000000, start < end, and end - start
+	// equals the size it asked Direct3D_SetPushBufferSize for.
+	//
+	// Cxbx-Reloaded lets the Xbox Direct3D_CreateDevice run via its trampoline, so
+	// the title's own library allocates a real push buffer and keeps these three
+	// fields consistent by itself. They are logged, not written: the unpatched
+	// D3D::MakeRequestedSpace and the SetRenderState_* family both read and update
+	// +0x00 as the live write cursor, so overwriting it from the host would corrupt
+	// the title's own FIFO bookkeeping.
+	{
+		uint32_t *pFifo = (uint32_t *)pXboxDevice;
+		EmuLog(LOG_LEVEL::INFO, "Xbox GPU FIFO fields: current=0x%08X start=0x%08X end=0x%08X (size=0x%X, aligned=%s, ordered=%s)",
+			pFifo[0x00 / 4], pFifo[0x24 / 4], pFifo[0x28 / 4],
+			pFifo[0x28 / 4] - pFifo[0x24 / 4],
+			(pFifo[0x24 / 4] & 0x3FF) ? "NO" : "yes",
+			(pFifo[0x24 / 4] < pFifo[0x28 / 4]) ? "yes" : "NO");
+	}
+
+	return true;
+}
+
+// Reports every fence handed out so far as passed by the GPU.
+// Correct for Cxbx-Reloaded because all rendering is done synchronously on the
+// host before control returns to the title, so the emulated GPU is never behind.
+static void CxbxrImpl_CatchUpXboxFence()
+{
+	if (!CxbxrLocateXboxFence()) {
+		return;
+	}
+
+	*g_pXbox_GpuFence = *g_pXbox_Fence;
+}
+
+// ******************************************************************
+// * patch: D3D_KickOffAndWaitForIdle
+// ******************************************************************
+//
+// Xbox implementation (disassembled from this title's D3D8D library):
+//
+//    D3D::KickOffAndWaitForIdle():
+//        BlockOnTime(D3D__Device.m_Fence, 2)
+//        if (D3D__Device+0x50) DXGRIP("...")   // debug deadlock reporter
+//
+// It is the tail of D3DDevice_BlockUntilIdle, and D3D::BlockOnResource
+// reaches it too, so patching this one entry point covers all three.
+//
+// Cxbx-Reloaded issues every draw synchronously on the host, so the emulated
+// GPU is never behind the CPU and "wait until idle" is always instantly true.
+// Report the fence as passed and return, rather than letting the Xbox code
+// consult NV2A state that HLE never advances.
+xbox::void_xt WINAPI xbox::EMUPATCH(D3D_KickOffAndWaitForIdle)()
+{
+	LOG_FUNC();
+
+	CxbxrImpl_CatchUpXboxFence();
+}
+
+// ******************************************************************
+// * patch: D3DDevice_KickPushBuffer
+// ******************************************************************
+//
+// Xbox implementation (22 bytes, disassembled):
+//
+//    D3DDevice_KickPushBuffer():
+//        ++someCounter
+//        ecx = D3D_g_pDevice
+//        jmp D3D::CDevice::KickOff       // tail call
+//
+// CDevice::KickOff writes the NV2A PUT register and then polls real GPU state
+// (D3DDevice_IsBusy / D3D::DXGRIP) waiting for the pushed work to retire.
+// Under HLE there is no push buffer being consumed and the GET pointer never
+// moves, so that poll cannot terminate.
+//
+// The title reaches this from Device::ClearResourceFromDevice
+// (Flush -> InsertFence -> KickPushBuffer) and from the loading screens.
+// Since the host has already drawn everything, "kick and retire" is a no-op
+// apart from making the fence reflect that.
+xbox::void_xt WINAPI xbox::EMUPATCH(D3DDevice_KickPushBuffer)()
+{
+	LOG_FUNC();
+
+	CxbxrImpl_CatchUpXboxFence();
+}
+
+// ******************************************************************
 // * patch: D3DDevice_InsertFence
 // ******************************************************************
 xbox::dword_xt WINAPI xbox::EMUPATCH(D3DDevice_InsertFence)()
 {
 	LOG_FUNC();
 
-    // TODO: Actually implement this
-    dword_xt dwRet = 0x8000BEEF;
+	dword_xt dwRet;
 
-	LOG_UNIMPLEMENTED();
+	if (CxbxrLocateXboxFence()) {
+		// Mirror what D3D::SetFence does on hardware: hand out the current fence
+		// value and step m_Fence by two so that it stays odd.
+		dwRet = *g_pXbox_Fence;
+		*g_pXbox_Fence = dwRet + 2;
 
-    return dwRet;
+		// We render synchronously, so by the time the title looks at this fence
+		// the "GPU" has already passed it.
+		*g_pXbox_GpuFence = *g_pXbox_Fence;
+	}
+	else {
+		// Without the device structure we can't keep the title's own bookkeeping
+		// in sync, but we can still hand out plausible, increasing fence values.
+		static dword_xt dwFallbackFence = 1;
+		dwRet = dwFallbackFence;
+		dwFallbackFence += 2;
+	}
+
+	RETURN(dwRet);
 }
 
 // ******************************************************************
@@ -9637,8 +10074,8 @@ xbox::bool_xt WINAPI xbox::EMUPATCH(D3DDevice_IsFencePending)
 {
 	LOG_FUNC_ONE_ARG(Fence);
 
-	// TODO: Implement
-	LOG_UNIMPLEMENTED();
+	// Nothing is ever pending: all rendering has already completed on the host.
+	CxbxrImpl_CatchUpXboxFence();
 
 	return FALSE;
 }
@@ -9653,8 +10090,8 @@ xbox::void_xt WINAPI xbox::EMUPATCH(D3DDevice_BlockOnFence)
 {
 	LOG_FUNC_ONE_ARG(Fence);
 
-    // TODO: Implement
-	LOG_UNIMPLEMENTED();
+	// There is nothing to wait for - just make sure the title can see that.
+	CxbxrImpl_CatchUpXboxFence();
 }
 
 // ******************************************************************
@@ -9667,8 +10104,9 @@ xbox::void_xt WINAPI xbox::EMUPATCH(D3DResource_BlockUntilNotBusy)
 {
 	LOG_FUNC_ONE_ARG(pThis);
 
-    // TODO: Implement
-	LOG_UNIMPLEMENTED();
+	// Again nothing to wait for - the fence the resource was last used at has
+	// already been passed as far as the title can tell.
+	CxbxrImpl_CatchUpXboxFence();
 }
 
 // ******************************************************************
@@ -10036,6 +10474,10 @@ xbox::bool_xt WINAPI xbox::EMUPATCH(D3DDevice_IsBusy)()
 
 	// NOTE: This function returns FALSE when the NV2A FIFO is empty/complete, or NV_PGRAPH_STATUS = 0
 	// Otherwise, it returns true.
+
+	// The title is explicitly asking whether the GPU is still working; take the
+	// opportunity to let its own fence bookkeeping catch up too.
+	CxbxrImpl_CatchUpXboxFence();
 
 	return FALSE;
 }

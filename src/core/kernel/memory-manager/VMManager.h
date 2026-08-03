@@ -102,6 +102,8 @@ class VMManager : public PhysicalMemory
 		void Initialize(unsigned int SystemType, int BootFlags, blocks_reserved_t blocks_reserved);
 		// retrieves memory statistics
 		void MemoryStatistics(xbox::PMM_STATISTICS memory_statistics);
+		// retrieves memory statistics in the shape xbdm's DmQueryMemoryStatistics reports
+		void MemoryStatisticsXbdm(struct _DM_MEMORY_STATISTICS* memory_statistics);
 		// allocates memory in the system region
 		VAddr AllocateSystemMemory(xbox::PageType BusyType, DWORD Perms, size_t Size, bool bAddGuardPage);
 		// allocates memory in the contiguous region
@@ -202,5 +204,9 @@ class VMManager : public PhysicalMemory
 
 
 extern VMManager g_VMManager;
+
+// Points the xbdm layer at the memory manager (see CxbxXbdm.cpp). Call once during
+// emulation startup, before any xbdm import thunk can be reached.
+void CxbxrInitXbdmHooks();
 
 #endif

@@ -143,4 +143,10 @@ extern void CxbxImpl_SetVertexData4f(int Register, FLOAT a, FLOAT b, FLOAT c, FL
 
 extern DWORD g_dwPrimPerFrame;
 
+// True when the last CxbxVertexBufferConverter::Apply() found a stream in the active
+// declaration with no Xbox vertex buffer behind it, and therefore bound a null stream
+// source on the host. Drawing in that state faults inside the host D3D9 runtime rather
+// than returning an error, so callers must skip the draw. See the definition for detail.
+extern bool CxbxDrawHasUnboundStream();
+
 #endif

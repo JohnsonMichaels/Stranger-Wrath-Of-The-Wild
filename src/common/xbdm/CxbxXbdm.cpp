@@ -28,21 +28,58 @@
 #define LOG_PREFIX CXBXR_MODULE::XBDM
 
 #include <cstdio>
+#include <cstdlib>
 #include <cctype>
 #include <clocale>
 
 #include "Cxbx.h"
 #include "Logging.h"
+#include "common\xbdm\CxbxXbdm.h"
+
+// Filled in by the memory manager during emulation startup. This is a runtime hook
+// rather than a direct call for two reasons: including VMManager.h here would drag
+// in the kernel's xbox.h/rtl.h, which only compile inside a kernel translation
+// unit; and this file is also compiled into the GUI process, which does not link
+// the memory manager at all and so cannot satisfy a link-time reference to it.
+void (*g_pfnXbdmQueryMemoryStatistics)(PDM_MEMORY_STATISTICS) = nullptr;
+
+// Calling convention note
+// -----------------------
+// Every xbdm export is __stdcall - the callee pops the arguments. The stubs below
+// were originally declared as plain (__cdecl) functions taking no arguments, so a
+// title calling one left its arguments stranded on the stack: there is no
+// "add esp,N" at the call sites to clean up after a __cdecl callee that the
+// compiler believed was __stdcall. Repeated calls walk the stack away.
+//
+// The decorations are not inferred - they are read out of the titles' own PDBs,
+// which carry the import thunks as __imp__<name>@<argbytes>. Fixing the eleven
+// entry points listed below covers every xbdm ordinal imported by any of the
+// three 2004 Stranger's Wrath builds (2, 4, 9, 21, 24, 25, 30, 36, 51, 72, 75).
+// The remaining stubs are still __cdecl/void: nothing observed imports them, and
+// inventing an argument count for a function that is actually called would be
+// worse than the leak, since popping the wrong amount corrupts the caller
+// outright. Give one a real signature when a title is seen to import it.
 
 namespace xbdm {
 	// 0x0001 (1)
 	void DmAllocatePool() { LOG_FUNC(); LOG_UNIMPLEMENTED(); }
-	// 0x0002 (2)
-	void DmAllocatePoolWithTag() { LOG_FUNC(); LOG_UNIMPLEMENTED(); }
+	// 0x0002 (2) __imp__DmAllocatePoolWithTag@8
+	void* __stdcall DmAllocatePoolWithTag(uint32_t Size, uint32_t Tag)
+	{
+		EmuLog(LOG_LEVEL::DEBUG, "DmAllocatePoolWithTag(Size = 0x%X, Tag = 0x%08X)", Size, Tag);
+		// Returns a debug-monitor pool block. Cxbx has no debug monitor heap, but
+		// handing back host memory is closer to the truth than returning garbage,
+		// and DmFreePool below releases it again.
+		return malloc(Size);
+	}
 	// 0x0003 (3)
 	void DmCloseCounters() { LOG_FUNC(); LOG_UNIMPLEMENTED(); }
-	// 0x0004 (4)
-	void DmCloseLoadedModules() { LOG_FUNC(); LOG_UNIMPLEMENTED(); }
+	// 0x0004 (4) __imp__DmCloseLoadedModules@4
+	long __stdcall DmCloseLoadedModules(void* hEnum)
+	{
+		EmuLog(LOG_LEVEL::DEBUG, "DmCloseLoadedModules(hEnum = 0x%08X)", (unsigned)(uintptr_t)hEnum);
+		return XBDM_NOERR;
+	}
 	// 0x0005 (5)
 	void DmCloseModuleSections() { LOG_FUNC(); LOG_UNIMPLEMENTED(); }
 	// 0x0006 (6)
@@ -51,8 +88,12 @@ namespace xbdm {
 	void DmClosePerformanceCounter() { LOG_FUNC(); LOG_UNIMPLEMENTED(); }
 	// 0x0008 (8)
 	void DmContinueThread() { LOG_FUNC(); LOG_UNIMPLEMENTED(); }
-	// 0x0009 (9)
-	void DmFreePool() { LOG_FUNC(); LOG_UNIMPLEMENTED(); }
+	// 0x0009 (9) __imp__DmFreePool@4
+	void __stdcall DmFreePool(void* pBlock)
+	{
+		EmuLog(LOG_LEVEL::DEBUG, "DmFreePool(pBlock = 0x%08X)", (unsigned)(uintptr_t)pBlock);
+		free(pBlock);
+	}
 	// 0x000A (10)
 	void DmGetMemory() { LOG_FUNC(); LOG_UNIMPLEMENTED(); }
 	// 0x000B (11)
@@ -75,16 +116,36 @@ namespace xbdm {
 	void DmGo() { LOG_FUNC(); LOG_UNIMPLEMENTED(); }
 	// 0x0014 (20)
 	void DmHaltThread() { LOG_FUNC(); LOG_UNIMPLEMENTED(); }
-	// 0x0015 (21)
-	void DmIsDebuggerPresent() { LOG_FUNC(); LOG_UNIMPLEMENTED(); }
+	// 0x0015 (21) __imp__DmIsDebuggerPresent@0
+	int __stdcall DmIsDebuggerPresent()
+	{
+		// No debug monitor is attached under Cxbx. Titles branch on this to decide
+		// whether the rest of the Dm* API is worth calling at all, so answering
+		// FALSE here is both truthful and the quieter path.
+		return 0;
+	}
 	// 0x0016 (22)
 	void DmIsThreadStopped() { LOG_FUNC(); LOG_UNIMPLEMENTED(); }
 	// 0x0017 (23)
 	void DmLoadExtension() { LOG_FUNC(); LOG_UNIMPLEMENTED(); }
-	// 0x0018 (24)
-	void DmNotify() { LOG_FUNC(); LOG_UNIMPLEMENTED(); }
-	// 0x0019 (25)
-	void DmOpenNotificationSession() { LOG_FUNC(); LOG_UNIMPLEMENTED(); }
+	// 0x0018 (24) __imp__DmNotify@12
+	long __stdcall DmNotify(void* hSession, uint32_t dwNotification, void* pfn)
+	{
+		EmuLog(LOG_LEVEL::DEBUG, "DmNotify(hSession = 0x%08X, dwNotification = 0x%08X, pfn = 0x%08X)",
+			(unsigned)(uintptr_t)hSession, dwNotification, (unsigned)(uintptr_t)pfn);
+		return XBDM_NOERR;
+	}
+	// 0x0019 (25) __imp__DmOpenNotificationSession@8
+	long __stdcall DmOpenNotificationSession(uint32_t dwFlags, void** phSession)
+	{
+		EmuLog(LOG_LEVEL::DEBUG, "DmOpenNotificationSession(dwFlags = 0x%08X, phSession = 0x%08X)",
+			dwFlags, (unsigned)(uintptr_t)phSession);
+		// Hand back a non-null cookie: titles check the handle, not its contents.
+		if (phSession != nullptr) {
+			*phSession = (void*)(uintptr_t)0xDB000001;
+		}
+		return XBDM_NOERR;
+	}
 	// 0x001A (26)
 	void DmOpenPerformanceCounter() { LOG_FUNC(); LOG_UNIMPLEMENTED(); }
 	// 0x001B (27)
@@ -93,17 +154,15 @@ namespace xbdm {
 	void DmReboot() { LOG_FUNC(); LOG_UNIMPLEMENTED(); }
 	// 0x001D (29) Unassigned
 
-	// 0x001E (30)
-	HRESULT DmRegisterCommandProcessor(LPCSTR sz, void *pfn) // PDM_CMDPROC  pfn
-	{ 
-		LOG_FUNC_BEGIN
-			LOG_FUNC_ARG(sz)
-			LOG_FUNC_ARG(pfn)
-			LOG_FUNC_END; 
+	// 0x001E (30) __imp__DmRegisterCommandProcessor@8
+	long __stdcall DmRegisterCommandProcessor(LPCSTR sz, void *pfn) // PDM_CMDPROC  pfn
+	{
+		EmuLog(LOG_LEVEL::DEBUG, "DmRegisterCommandProcessor(sz = \"%s\", pfn = 0x%08X)",
+			sz ? sz : "(null)", (unsigned)(uintptr_t)pfn);
 
 		LOG_UNIMPLEMENTED(); // TODO : Connect the command processor callback to Cxbx'x debug console
 
-		return S_OK;
+		return XBDM_NOERR;
 	}
 
 	// 0x001F (31) Unassigned
@@ -116,11 +175,12 @@ namespace xbdm {
 	// 0x0023 (35)
 	void DmResumeThread() { LOG_FUNC(); LOG_UNIMPLEMENTED(); }
 
-	// 0x0024 (36)
-	void DmSendNotificationString(LPCSTR sz)
-	{ 
+	// 0x0024 (36) __imp__DmSendNotificationString@4
+	long __stdcall DmSendNotificationString(LPCSTR sz)
+	{
 		// Just send this string to Cxbx's debug output :
-		EmuLog(LOG_LEVEL::DEBUG, "%s", sz);
+		EmuLog(LOG_LEVEL::DEBUG, "%s", sz ? sz : "(null)");
+		return XBDM_NOERR;
 	}
 
 	// 0x0025 (37)
@@ -151,8 +211,16 @@ namespace xbdm {
 	void DmThreadUserData() { LOG_FUNC(); LOG_UNIMPLEMENTED(); }
 	// 0x0032 (50)
 	void DmUnloadExtension() { LOG_FUNC(); LOG_UNIMPLEMENTED(); }
-	// 0x0033 (51)
-	void DmWalkLoadedModules() { LOG_FUNC(); LOG_UNIMPLEMENTED(); }
+	// 0x0033 (51) __imp__DmWalkLoadedModules@8
+	long __stdcall DmWalkLoadedModules(void** phEnum, void* pdmmi)
+	{
+		EmuLog(LOG_LEVEL::DEBUG, "DmWalkLoadedModules(phEnum = 0x%08X, pdmmi = 0x%08X)",
+			(unsigned)(uintptr_t)phEnum, (unsigned)(uintptr_t)pdmmi);
+		// Report an empty enumeration rather than success with an uninitialised
+		// module record - a caller that believes it got a module will dereference
+		// whatever pdmmi happened to contain.
+		return XBDM_ENDOFLIST;
+	}
 	// 0x0034 (52)
 	void DmWalkModuleSections() { LOG_FUNC(); LOG_UNIMPLEMENTED(); }
 	// 0x0035 (53)
@@ -193,11 +261,46 @@ namespace xbdm {
 	void _CAP_Enter_Function() { LOG_FUNC(); LOG_UNIMPLEMENTED(); }
 	// 0x0047 (71)
 	void _CAP_Exit_Function() { LOG_FUNC(); LOG_UNIMPLEMENTED(); }
-	// 0x0048 (72)
-	void DmRegisterCommandProcessorEx() { LOG_FUNC(); LOG_UNIMPLEMENTED(); }
+	// 0x0048 (72) __imp__DmRegisterCommandProcessorEx@12
+	long __stdcall DmRegisterCommandProcessorEx(LPCSTR sz, void* pfn, int fRunWithTitle)
+	{
+		EmuLog(LOG_LEVEL::DEBUG, "DmRegisterCommandProcessorEx(sz = \"%s\", pfn = 0x%08X, fRunWithTitle = %d)",
+			sz ? sz : "(null)", (unsigned)(uintptr_t)pfn, fRunWithTitle);
+		return XBDM_NOERR;
+	}
+
+	// 0x0049 (73) Not implemented
+	// 0x004A (74) Not implemented
+
+	// 0x004B (75) __imp__DmQueryMemoryStatistics@4
+	long __stdcall DmQueryMemoryStatistics(PDM_MEMORY_STATISTICS pdmms)
+	{
+		if (pdmms == nullptr || pdmms->cbSize != sizeof(DM_MEMORY_STATISTICS)) {
+			EmuLog(LOG_LEVEL::WARNING, "DmQueryMemoryStatistics : bad argument (pdmms = 0x%08X, cbSize = 0x%X, expected 0x%X)",
+				(unsigned)(uintptr_t)pdmms, pdmms ? pdmms->cbSize : 0, (unsigned)sizeof(DM_MEMORY_STATISTICS));
+			return XBDM_NOERR;
+		}
+
+		// The caller only fills in cbSize; everything else is whatever was on its
+		// stack. Clear it first so a partial answer never reads back as garbage.
+		const uint32_t cbSize = pdmms->cbSize;
+		memset(pdmms, 0, sizeof(DM_MEMORY_STATISTICS));
+		pdmms->cbSize = cbSize;
+
+		if (g_pfnXbdmQueryMemoryStatistics == nullptr) {
+			EmuLog(LOG_LEVEL::WARNING, "DmQueryMemoryStatistics : no provider registered");
+			return XBDM_NOERR;
+		}
+
+		g_pfnXbdmQueryMemoryStatistics(pdmms);
+
+		EmuLog(LOG_LEVEL::DEBUG, "DmQueryMemoryStatistics : total %u, available %u, virtual-mapped %u, contiguous %u (pages)",
+			pdmms->TotalPages, pdmms->AvailablePages, pdmms->VirtualMappedPages, pdmms->ContiguousPages);
+		return XBDM_NOERR;
+	}
 }
 
-uint32_t Cxbx_LibXbdmThunkTable[1 + 72] =
+uint32_t Cxbx_LibXbdmThunkTable[1 + CXBX_XBDM_MAX_ORDINAL] =
 {
 #define PANIC(numb) numb
 #define FUNC(f) f
@@ -276,4 +379,7 @@ uint32_t Cxbx_LibXbdmThunkTable[1 + 72] =
 	(uint32_t)FUNC(&xbdm::_CAP_Enter_Function),                      // 0x0046 (70)
 	(uint32_t)FUNC(&xbdm::_CAP_Exit_Function),                       // 0x0047 (71)
 	(uint32_t)FUNC(&xbdm::DmRegisterCommandProcessorEx),             // 0x0048 (72)
+	(uint32_t)PANIC(0x0049),                                         // 0x0049 (73)
+	(uint32_t)PANIC(0x004A),                                         // 0x004A (74)
+	(uint32_t)FUNC(&xbdm::DmQueryMemoryStatistics),                  // 0x004B (75)
 };

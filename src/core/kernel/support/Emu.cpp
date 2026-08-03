@@ -301,6 +301,37 @@ long WINAPI lleException(EXCEPTION_POINTERS *e)
 	return result;
 }
 
+// Reads the two bytes preceding EIP, used to detect the "int 2Dh; int 3" debug
+// command sequence. This has to be guarded: when a title jumps to a bad address
+// EIP itself is unmapped, and an unguarded read here turns the exception handler
+// into a second, fatal access violation - which loses the crash report entirely.
+static uint16_t EmuPeekOpcodeBeforeEip(const CONTEXT *pContext)
+{
+	__try {
+		return *(uint16_t *)(pContext->Eip - 2);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		return 0;
+	}
+}
+
+// Prints the string passed to the Xbox "int 2Dh" DEBUG_PRINT debug command.
+// Xbox ANSI_STRINGs are counted and are NOT guaranteed to be NUL terminated, so
+// this must never be handed to "%s": doing so reads past the end of the buffer
+// and can fault, and because we are already inside an exception handler that
+// second fault takes the whole emulator down without any diagnostics at all.
+// Test case: Oddworld: Stranger's Wrath (2004 debug beta), which prints a great
+// deal of engine logging through this path.
+static void EmuPrintDebugString(xbox::PANSI_STRING pString)
+{
+	__try {
+		printf("DEBUG_PRINT: %.*s\n", (int)pString->Length, pString->Buffer);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		printf("DEBUG_PRINT: <unreadable ANSI_STRING at 0x%08X>\n", (unsigned)(uintptr_t)pString);
+	}
+}
+
 // Only for Cxbx emulation coding (to catch all of last resort exception may occur.)
 bool EmuTryHandleException(EXCEPTION_POINTERS *e)
 {
@@ -311,7 +342,7 @@ bool EmuTryHandleException(EXCEPTION_POINTERS *e)
 	}
 
 	if (e->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) {
-		bool isInt2Dh = *(uint16_t*)(e->ContextRecord->Eip - 2) == 0x2DCD;
+		bool isInt2Dh = EmuPeekOpcodeBeforeEip(e->ContextRecord) == 0x2DCD;
 
 		switch (e->ExceptionRecord->ExceptionCode) {
 		case STATUS_BREAKPOINT:
@@ -325,7 +356,7 @@ bool EmuTryHandleException(EXCEPTION_POINTERS *e)
 				switch (e->ContextRecord->Eax) {
 					case 1: // DEBUG_PRINT
 						// In this case, ECX should point to an ANSI String
-						printf("DEBUG_PRINT: %s\n", ((xbox::PANSI_STRING)e->ContextRecord->Ecx)->Buffer);
+						EmuPrintDebugString((xbox::PANSI_STRING)e->ContextRecord->Ecx);
 						break;
 					default:
 						printf("Unhandled Debug Command: int 2Dh, EAX = %d", e->ContextRecord->Eip);

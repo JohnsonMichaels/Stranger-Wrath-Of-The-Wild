@@ -35,6 +35,7 @@
 // TODO : Use Boost.Format https://www.boost.org/doc/libs/1_53_0/libs/format/index.html
 thread_local std::string _logThreadPrefix;
 
+std::atomic_bool g_LogFlushEveryLine(false);
 std::atomic_bool g_EnabledModules[to_underlying(CXBXR_MODULE::MAX)] = { false };
 const char* g_EnumModules2String[to_underlying(CXBXR_MODULE::MAX)] = {
 	"CXBXR   ",
@@ -152,7 +153,9 @@ void EmuLogOutput(CXBXR_MODULE cxbxr_module, LOG_LEVEL level, const char *szWarn
 	// Only flush synchronously on fatal errors. Flushing on every message
 	// adds a synchronous OS round-trip (~0.1–10 ms on Windows Console Host)
 	// that stalls the emulation thread and causes GPU under-submission on AMD.
-	if (level == LOG_LEVEL::FATAL) {
+	// When the log goes to a file that trade-off inverts: the write is cheap,
+	// and without it a crash silently eats the last block - see g_LogFlushEveryLine.
+	if (level == LOG_LEVEL::FATAL || g_LogFlushEveryLine) {
 		fflush(stdout);
 	}
 }

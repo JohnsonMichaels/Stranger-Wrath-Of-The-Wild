@@ -38,6 +38,7 @@
 
 #include <map>
 #include <unordered_map>
+#include <vector>
 #include <subhook.h>
 
 typedef struct {
@@ -65,6 +66,13 @@ std::map<const std::string, const xbox_patch_t> g_PatchTable = {
 	PATCH_ENTRY("CDevice_SetStateVB", xbox::EMUPATCH(CDevice_SetStateVB), PATCH_HLE_D3D),
 	PATCH_ENTRY("CDevice_SetStateVB_8", xbox::EMUPATCH(CDevice_SetStateVB_8), PATCH_HLE_D3D),
 	PATCH_ENTRY("D3DDevice_Begin", xbox::EMUPATCH(D3DDevice_Begin), PATCH_HLE_D3D),
+	// Some XDKs (5788 debug, as shipped in Stranger's Wrath) export the symbol
+	// unsuffixed. Without this entry the pair is half-patched: the title gets the
+	// real Xbox BeginPush and writes into the actual FIFO, then the patched EndPush
+	// finds g_pXbox_BeginPush_Buffer == nullptr and drops the whole batch.
+	// The unsuffixed form has the _4 signature - one stacked argument (ret 4),
+	// push pointer returned in eax - so it can share that patch directly.
+	PATCH_ENTRY("D3DDevice_BeginPush", xbox::EMUPATCH(D3DDevice_BeginPush_4), PATCH_HLE_D3D),
 	PATCH_ENTRY("D3DDevice_BeginPush_4", xbox::EMUPATCH(D3DDevice_BeginPush_4), PATCH_HLE_D3D),
 	PATCH_ENTRY("D3DDevice_BeginPush_8", xbox::EMUPATCH(D3DDevice_BeginPush_8), PATCH_HLE_D3D),
 	PATCH_ENTRY("D3DDevice_BeginVisibilityTest", xbox::EMUPATCH(D3DDevice_BeginVisibilityTest), PATCH_HLE_D3D),
@@ -117,6 +125,10 @@ std::map<const std::string, const xbox_patch_t> g_PatchTable = {
 	PATCH_ENTRY("D3DDevice_InsertFence", xbox::EMUPATCH(D3DDevice_InsertFence), PATCH_HLE_D3D),
 	PATCH_ENTRY("D3DDevice_IsBusy", xbox::EMUPATCH(D3DDevice_IsBusy), PATCH_HLE_D3D),
 	PATCH_ENTRY("D3DDevice_IsFencePending", xbox::EMUPATCH(D3DDevice_IsFencePending), PATCH_HLE_D3D),
+	// Tail-jumps into D3D::CDevice::KickOff, which writes the NV2A PUT register and
+	// then polls for the pushed work to retire. HLE never advances the FIFO GET
+	// pointer, so that poll cannot terminate - see the patch body for detail.
+	PATCH_ENTRY("D3DDevice_KickPushBuffer", xbox::EMUPATCH(D3DDevice_KickPushBuffer), PATCH_HLE_D3D),
 	PATCH_ENTRY("D3DDevice_LightEnable", xbox::EMUPATCH(D3DDevice_LightEnable), PATCH_HLE_D3D),
 	PATCH_ENTRY("D3DDevice_LightEnable_4__LTCG_eax1", xbox::EMUPATCH(D3DDevice_LightEnable_4__LTCG_eax1), PATCH_HLE_D3D),
 	PATCH_ENTRY("D3DDevice_LoadVertexShader", xbox::EMUPATCH(D3DDevice_LoadVertexShader), PATCH_HLE_D3D),
@@ -207,6 +219,11 @@ std::map<const std::string, const xbox_patch_t> g_PatchTable = {
 	PATCH_ENTRY("D3D_BlockOnTime", xbox::EMUPATCH(D3D_BlockOnTime), PATCH_HLE_D3D),
 	PATCH_ENTRY("D3D_BlockOnTime_4__LTCG_eax1", xbox::EMUPATCH(D3D_BlockOnTime_4__LTCG_eax1), PATCH_HLE_D3D),
 	PATCH_ENTRY("D3D_CommonSetRenderTarget", xbox::EMUPATCH(D3D_CommonSetRenderTarget), PATCH_HLE_D3D),
+	// One patch covers three entry points: D3DDevice_BlockUntilIdle tail-calls this,
+	// and D3D::BlockOnResource calls it. Debug XDKs export BlockUntilIdle, which
+	// retail-focused Cxbx has no signature for, so patching the shared tail is the
+	// only way to reach it.
+	PATCH_ENTRY("D3D_KickOffAndWaitForIdle", xbox::EMUPATCH(D3D_KickOffAndWaitForIdle), PATCH_HLE_D3D),
     PATCH_ENTRY("D3D_DestroyResource", xbox::EMUPATCH(D3D_DestroyResource), PATCH_HLE_D3D),
 	PATCH_ENTRY("D3D_DestroyResource_0__LTCG_edi1", xbox::EMUPATCH(D3D_DestroyResource_0__LTCG_edi1), PATCH_HLE_D3D),
 	PATCH_ENTRY("D3D_LazySetPointParams", xbox::EMUPATCH(D3D_LazySetPointParams), PATCH_HLE_D3D),
@@ -480,6 +497,16 @@ inline void EmuInstallPatch(const std::string FunctionName, const xbox::addr_xt 
 {
 	auto it = g_PatchTable.find(FunctionName);
 	if (it == g_PatchTable.end()) {
+		// A symbol was located in the title but there is no patch registered under
+		// that exact name. This used to return silently, which made a whole class of
+		// bug invisible: a mismatched pair such as D3DDevice_BeginPush (no entry, so
+		// the title keeps the real Xbox implementation) next to D3DDevice_EndPush
+		// (patched) looks like nothing is wrong, but the batch is silently dropped.
+		// Debug-XDK titles hit this hard - they export ~25 functions retail D3D8 does
+		// not have, none of which Cxbx has ever seen. Print the name so the gap is at
+		// least visible in the log; this is diagnostic only and changes no behaviour.
+		printf("HLE: %s: No patch registered (symbol found at 0x%08X, running unpatched)\n",
+			FunctionName.c_str(), FunctionAddr);
 		return;
 	}
 
@@ -528,9 +555,173 @@ static void EmuNopPatch(uintptr_t addr, size_t len)
 	}
 }
 
+// Picks the winner when two patchable symbol names resolve to one address.
+//
+// For an LTCG title the scanner runs the LTCG signature database in addition to -
+// not instead of - the standard one, and a symbol cache may also carry names
+// recovered from a PDB. Either way one function can come back under two names: the
+// plain form and an "__LTCG_<reg><n>" form. Installing both leaves whichever ran
+// last in charge, and the two disagree about where the arguments live: the plain
+// patch reads them off the stack, the LTCG patch out of registers. The result is a
+// patch that reads a garbage argument, with nothing in the log to say why.
+//
+// The LTCG name is the one to trust. The LTCG database is only ever consulted for a
+// title that links D3D8LTCG, so a collision like this cannot occur in a title whose
+// D3D really does use the stack.
+//
+// Test case: Oddworld: Stranger's Wrath (2004-05-22 Final build). Both
+// D3DDevice_SetTransform and D3DDevice_SetTransform_0__LTCG_eax1_edx2 resolve to
+// 0x002054B0, which starts "mov ecx, eax / shl ecx, 6 ... mov esi, edx" - State in
+// EAX and pMatrix in EDX, no stack arguments at all. With the plain patch installed
+// the title aborted on "Unknown Transform State Type (2199536)", 2199536 being the
+// stack slot's contents (0x00218C30) rather than a transform state.
+static bool PreferSymbolName(const std::string& candidate, const std::string& incumbent)
+{
+	const bool candidateIsLTCG = candidate.find("__LTCG_") != std::string::npos;
+	const bool incumbentIsLTCG = incumbent.find("__LTCG_") != std::string::npos;
+	if (candidateIsLTCG != incumbentIsLTCG) {
+		return candidateIsLTCG;
+	}
+
+	// Neither or both are LTCG - no reason to prefer either, so keep the first
+	// seen and stay deterministic.
+	return false;
+}
+
+// Strips the decorations that distinguish variants of ONE function from each other:
+// the "__LTCG_<reg><n>" calling-convention tag, a trailing "_<stackbytes>" argument-size
+// tag, and a trailing "__r<n>" revision tag. What is left is the function's identity.
+static std::string StripSymbolVariantTags(const std::string& name)
+{
+	std::string base = name;
+
+	auto ltcg = base.find("__LTCG_");
+	if (ltcg != std::string::npos) {
+		base.resize(ltcg);
+	}
+
+	auto rev = base.rfind("__r");
+	if (rev != std::string::npos && rev + 3 < base.size()
+	 && base.find_first_not_of("0123456789", rev + 3) == std::string::npos) {
+		base.resize(rev);
+	}
+
+	auto us = base.rfind('_');
+	if (us != std::string::npos && us + 1 < base.size()
+	 && base.find_first_not_of("0123456789", us + 1) == std::string::npos) {
+		base.resize(us);
+	}
+
+	return base;
+}
+
+// True when two symbol names plausibly name the SAME function - either identical after
+// their variant tags are stripped, or one is the other carrying a library prefix
+// (D3D_CDevice_KickOff vs CDevice_KickOff).
+static bool SymbolNamesLookLikeSameFunction(const std::string& a, const std::string& b)
+{
+	const std::string sa = StripSymbolVariantTags(a);
+	const std::string sb = StripSymbolVariantTags(b);
+	if (sa == sb) {
+		return true;
+	}
+
+	const std::string& shortName = (sa.size() < sb.size()) ? sa : sb;
+	const std::string& longName  = (sa.size() < sb.size()) ? sb : sa;
+	return longName.size() > shortName.size()
+	    && longName.compare(longName.size() - shortName.size(), shortName.size(), shortName) == 0;
+}
+
+// Two symbols that name DIFFERENT functions can never share one address. When the scanner
+// says they do, one of the two names is a misidentification - and if the misidentified name
+// is one we patch, we hook the wrong function and hand our patch arguments of the wrong type.
+//
+// This is reported rather than acted on, because the right answer needs a human: which of the
+// two names is wrong is not derivable from the names. Silence is what made this expensive -
+// D3DDevice_SetPixelShader and D3DDevice_SetPixelShaderProgram both resolved to 0x00208BF0 in
+// Oddworld: Stranger's Wrath (D3D8LTCG 5849) with nothing in the log to say so, and the patch
+// installed on SetPixelShaderProgram read pPSDef out of the middle of a shader definition and
+// access-violated. One printed line here would have named it immediately.
+static void ReportSuspectSymbolAddressCollisions()
+{
+	std::map<xbox::addr_xt, std::vector<std::string>> namesByAddress;
+	for (const auto& it : g_SymbolAddresses) {
+		// Offset-style pseudo-symbols carry small struct offsets, not addresses, and
+		// legitimately collide with each other.
+		if (it.first.size() > 7 && it.first.compare(it.first.size() - 7, 7, "_OFFSET") == 0) {
+			continue;
+		}
+
+		if (it.second != 0) {
+			namesByAddress[it.second].push_back(it.first);
+		}
+	}
+
+	for (const auto& entry : namesByAddress) {
+		const auto& names = entry.second;
+		if (names.size() < 2) {
+			continue;
+		}
+
+		for (const auto& name : names) {
+			if (g_PatchTable.find(name) == g_PatchTable.end()) {
+				continue; // Only a name we actually patch can do harm here
+			}
+
+			for (const auto& other : names) {
+				if (other == name || SymbolNamesLookLikeSameFunction(name, other)) {
+					continue;
+				}
+
+				printf("HLE: WARNING: %s and %s are different functions but both resolve to "
+				       "0x%08X - one of these symbols is wrong, and %s is patched\n",
+				       name.c_str(), other.c_str(), entry.first, name.c_str());
+			}
+		}
+	}
+}
+
 void EmuInstallPatches()
 {
+	ReportSuspectSymbolAddressCollisions();
+
+	// Resolve one-address-two-names collisions before installing anything.
+	// Only names we actually have a patch for can collide harmfully; symbols with
+	// no patch never install a hook, and offset-style symbols legitimately share
+	// small values with each other.
+	std::map<xbox::addr_xt, std::string> winnerByAddress;
 	for (const auto& it : g_SymbolAddresses) {
+		if (g_PatchTable.find(it.first) == g_PatchTable.end()) {
+			continue;
+		}
+
+		auto existing = winnerByAddress.find(it.second);
+		if (existing == winnerByAddress.end()) {
+			winnerByAddress[it.second] = it.first;
+			continue;
+		}
+
+		if (PreferSymbolName(it.first, existing->second)) {
+			printf("HLE: %s and %s both resolve to 0x%08X - using %s\n",
+				existing->second.c_str(), it.first.c_str(), it.second, it.first.c_str());
+			existing->second = it.first;
+		}
+		else {
+			printf("HLE: %s and %s both resolve to 0x%08X - using %s\n",
+				existing->second.c_str(), it.first.c_str(), it.second, existing->second.c_str());
+		}
+	}
+
+	for (const auto& it : g_SymbolAddresses) {
+		if (g_PatchTable.find(it.first) != g_PatchTable.end()) {
+			auto winner = winnerByAddress.find(it.second);
+			if (winner != winnerByAddress.end() && winner->second != it.first) {
+				// A different name won this address; installing this one too
+				// would stack a second hook on the first.
+				continue;
+			}
+		}
+
 		EmuInstallPatch(it.first, it.second);
 	}
 

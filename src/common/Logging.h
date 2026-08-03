@@ -120,6 +120,13 @@ extern std::atomic_bool g_EnabledModules[to_underlying(CXBXR_MODULE::MAX)];
 extern const char* g_EnumModules2String[to_underlying(CXBXR_MODULE::MAX)];
 extern std::atomic_int g_CurrentLogLevel;
 extern std::atomic_bool g_CurrentLogPopupTestCase;
+// Flush stdout after every log line. Set when the kernel log goes to a FILE:
+// stdout is then block-buffered, so a hard crash (or ExitProcess) discards up to
+// a full block - and the discarded block is precisely the run-up to the crash.
+// The visible end of the log is then an artifact rather than the failure point,
+// which is deeply misleading. Left off for console output, where each flush is a
+// synchronous round-trip through the Console Host.
+extern std::atomic_bool g_LogFlushEveryLine;
 
 // print out a log message to the console or kernel debug log file if level is high enough
 void EmuLogEx(CXBXR_MODULE cxbxr_module, LOG_LEVEL level, const char *szWarningMessage, ...);

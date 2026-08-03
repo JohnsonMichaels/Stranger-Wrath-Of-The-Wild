@@ -60,6 +60,23 @@ extern xbox::dword_xt g_Xbox_VertexShader_Handle;
 
 extern xbox::X_PixelShader *g_pXbox_PixelShader;
 
+// Render-progress counters, summarised to the kernel log every RENDERSTATS_SWAP_INTERVAL
+// frames by the D3DDevice_Swap patch. These exist because the only other way to tell a
+// title that is rendering from one that is merely alive was to switch on a whole log
+// module, and the D3D8 module emits hundreds of megabytes a minute for this title. They
+// are counters, not tracing: they cost an increment and print one line a second.
+extern unsigned g_RenderStat_Swaps;              // frames presented
+extern unsigned g_RenderStat_HostDraws;          // draws actually submitted to host D3D
+extern unsigned g_RenderStat_VertexShaderLookups;// GetXboxVertexShader() calls
+extern unsigned g_RenderStat_VertexShaderMissing;// ...of which returned no shader (no 3D possible)
+extern unsigned g_RenderStat_VertexShaderFromDevice;// ...of which came from the title's own D3D state
+extern unsigned g_RenderStat_NullTextureStages;   // empty texture stages filled in while a pixel shader was bound
+
+// Returns the vertex shader the title has currently selected, read from the Xbox D3D device
+// structure, or nullptr when that field cannot be located or does not hold a mapped pointer.
+// See the definition in Direct3D9.cpp for how the field and the struct layout were proven.
+xbox::X_D3DVertexShader *CxbxrGetXboxCurrentVertexShader();
+
 extern D3DFORMAT g_HostTextureFormats[xbox::X_D3DTS_STAGECOUNT];
 
 extern xbox::X_D3DBaseTexture *g_pXbox_SetTexture[xbox::X_D3DTS_STAGECOUNT];

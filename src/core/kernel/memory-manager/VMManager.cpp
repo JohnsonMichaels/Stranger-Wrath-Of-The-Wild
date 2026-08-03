@@ -41,6 +41,7 @@
 #include "EmuShared.h"
 #include "core\kernel\exports\EmuKrnl.h" // For InitializeListHead(), etc.
 #include "common/util/cliConfig.hpp" // For GetSessionID
+#include "common\xbdm\CxbxXbdm.h" // For DM_MEMORY_STATISTICS
 #include <assert.h>
 
 
@@ -555,6 +556,44 @@ void VMManager::MemoryStatistics(xbox::PMM_STATISTICS memory_statistics)
 	memory_statistics->ImagePagesCommitted = m_PagesByUsage[xbox::ImageType];
 
 	Unlock();
+}
+
+// xbdm reports the same accounting as MmQueryStatistics but split per page-usage
+// class instead of per commit type, and everything is in pages rather than bytes.
+// PageType happens to enumerate the same classes in the same order, so this is a
+// straight transcription rather than a mapping.
+void VMManager::MemoryStatisticsXbdm(struct _DM_MEMORY_STATISTICS* memory_statistics)
+{
+	Lock();
+
+	memory_statistics->TotalPages = g_SystemMaxMemory >> PAGE_SHIFT;
+	memory_statistics->AvailablePages = m_MmLayoutDebug && m_bAllowNonDebuggerOnTop64MiB ?
+		m_PhysicalPagesAvailable + m_DebuggerPagesAvailable : m_PhysicalPagesAvailable;
+	memory_statistics->StackPages = m_PagesByUsage[xbox::StackType];
+	memory_statistics->VirtualPageTablePages = m_PagesByUsage[xbox::VirtualPageTableType];
+	memory_statistics->SystemPageTablePages = m_PagesByUsage[xbox::SystemPageTableType];
+	memory_statistics->PoolPages = m_PagesByUsage[xbox::PoolType];
+	memory_statistics->VirtualMappedPages = m_PagesByUsage[xbox::VirtualMemoryType] +
+		m_PagesByUsage[xbox::SystemMemoryType];
+	memory_statistics->ImagePages = m_PagesByUsage[xbox::ImageType];
+	memory_statistics->FileCachePages = m_PagesByUsage[xbox::CacheType];
+	memory_statistics->ContiguousPages = m_PagesByUsage[xbox::ContiguousType];
+	memory_statistics->DebuggerPages = m_PagesByUsage[xbox::DebuggerType];
+
+	Unlock();
+}
+
+// Entry point for CxbxXbdm.cpp, which can neither include VMManager.h (it pulls in
+// kernel-only headers) nor link against it (the GUI process compiles the xbdm file
+// without the memory manager). Registered as a hook by CxbxrInitXbdmHooks below.
+static void QueryMemoryStatisticsXbdm(PDM_MEMORY_STATISTICS memory_statistics)
+{
+	g_VMManager.MemoryStatisticsXbdm(memory_statistics);
+}
+
+void CxbxrInitXbdmHooks()
+{
+	g_pfnXbdmQueryMemoryStatistics = QueryMemoryStatisticsXbdm;
 }
 
 VAddr VMManager::ClaimGpuMemory(size_t Size, size_t* BytesToSkip)

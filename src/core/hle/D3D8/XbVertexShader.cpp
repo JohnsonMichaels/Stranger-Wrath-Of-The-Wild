@@ -269,6 +269,15 @@ xbox::X_D3DVertexShader* GetXboxVertexShader()
 
 	using namespace xbox;
 
+	g_RenderStat_VertexShaderLookups++;
+
+	// Prefer the title's own D3D state over our shadow variable - see the comment on
+	// CxbxrGetXboxCurrentVertexShader (Direct3D9.cpp) for why, and how the layout was proven.
+	if (X_D3DVertexShader *pLiveVertexShader = CxbxrGetXboxCurrentVertexShader()) {
+		g_RenderStat_VertexShaderFromDevice++;
+		return pLiveVertexShader;
+	}
+
 	X_D3DVertexShader* pXboxVertexShader = xbox::zeroptr;
 #if 0 // TODO : Retrieve vertex shader from actual Xbox D3D state
 	// Only when we're sure of the location of the Xbox Device.m_pVertexShader variable
@@ -292,6 +301,7 @@ xbox::X_D3DVertexShader* GetXboxVertexShader()
 
 		// Now, to convert, we do need to have a valid vertex shader :
 		if (g_Xbox_VertexShader_Handle == 0) {
+			g_RenderStat_VertexShaderMissing++;
 			LOG_TEST_CASE("Unassigned Xbox vertex shader!");
 			return nullptr;
 		}
@@ -1327,12 +1337,41 @@ CxbxVertexDeclaration* CxbxGetVertexDeclaration()
 	return pCxbxVertexDeclaration;
 }
 
+// Set when the current vertex declaration cannot be used, so the draw that
+// would follow is skipped instead of submitted. See the comment below.
+bool g_Cxbx_SkipDrawNoVertexDeclaration = false;
+
 void CxbxUpdateHostVertexDeclaration()
 {
 	static CxbxVertexDeclaration* s_lastDeclaration = nullptr;
 	static bool s_lastVRegInDeclaration[X_VSH_MAX_ATTRIBUTES] = {};
 
 	CxbxVertexDeclaration* pCxbxVertexDeclaration = CxbxGetVertexDeclaration();
+
+	// A missing declaration must NOT reach the host, and must not be silently
+	// dereferenced here either.
+	//
+	// IDirect3DDevice9::SetVertexDeclaration(nullptr) is ACCEPTED - it simply
+	// unbinds - so the failure does not surface until the following draw, at
+	// which point d3d9.dll dereferences the declaration it does not have and
+	// takes an access violation INSIDE the runtime. Observed on the Oddworld
+	// Stranger's Wrath May 2004 build: 0xC0000005 at d3d9.dll+0x5E098, reading
+	// [reg+0x24] with ECX = 0, reached from two different draw call sites -
+	// which is what identified this as a shared null rather than a one-off.
+	//
+	// Skipping the draw loses that geometry, but leaves every other draw in the
+	// frame intact, so whatever the title CAN render still appears.
+	if (pCxbxVertexDeclaration == nullptr ||
+		pCxbxVertexDeclaration->pHostVertexDeclaration == nullptr) {
+		if (!g_Cxbx_SkipDrawNoVertexDeclaration) {
+			EmuLog(LOG_LEVEL::WARNING,
+				"No usable vertex declaration (%s) - skipping draws until one is set",
+				pCxbxVertexDeclaration == nullptr ? "none built" : "host declaration is null");
+		}
+		g_Cxbx_SkipDrawNoVertexDeclaration = true;
+		return;
+	}
+	g_Cxbx_SkipDrawNoVertexDeclaration = false;
 
 	if (pCxbxVertexDeclaration != s_lastDeclaration) {
 		s_lastDeclaration = pCxbxVertexDeclaration;
@@ -1391,6 +1430,12 @@ void CxbxImpl_SetVertexShaderInput(DWORD Handle, UINT StreamCount, xbox::X_STREA
 		// Xbox DOES store the Handle, but since it merely returns this through (unpatched) D3DDevice_GetVertexShaderInput, we don't have to.
 
 		g_Xbox_SetVertexShaderInput_Count = StreamCount; // This > 0 indicates g_Xbox_SetVertexShaderInput_Data has to be used
+		// Clear first: GetXboxVertexStreamInput indexes this array by the stream number a
+		// vertex attribute names, which is not bounded by StreamCount. Copying only
+		// StreamCount entries over the top left every higher slot holding whatever the
+		// previous SetVertexShaderInput call put there - a stale, possibly freed
+		// X_D3DVertexBuffer that then gets bound and drawn from.
+		memset(g_Xbox_SetVertexShaderInput_Data, 0, sizeof(g_Xbox_SetVertexShaderInput_Data));
 		memcpy(g_Xbox_SetVertexShaderInput_Data, pStreamInputs, StreamCount * sizeof(xbox::X_STREAMINPUT)); // Make a copy of the supplied StreamInputs array
 
 		g_Xbox_SetVertexShaderInput_Attributes = *CxbxGetVertexShaderAttributes(pXboxVertexShader); // Copy this vertex shaders's attribute slots

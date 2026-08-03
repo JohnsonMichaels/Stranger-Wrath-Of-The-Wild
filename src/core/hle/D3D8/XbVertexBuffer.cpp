@@ -286,6 +286,17 @@ static void VBPool_Return(IDirect3DVertexBuffer* vb)
 	}
 }
 
+// Set by ConvertStream when a declared stream has no Xbox vertex buffer behind it, so the
+// host stream source had to be cleared to null. Reset at the start of every Apply().
+//
+// Why this matters: IDirect3DDevice9::DrawIndexedPrimitive does not validate that every
+// stream referenced by the current declaration is actually bound - it dereferences the
+// stream object and faults. Observed in Oddworld: Stranger's Wrath (2004-05-22 Final) as
+// an access violation at d3d9+0x5E098 reading 0x00000024 with ECX = 0, three frames inside
+// d3d9, reached from the DrawIndexedPrimitive vtable call at the end of CxbxDrawIndexed.
+// Dropping the draw loses one batch; not dropping it kills the title.
+static bool g_bCxbxDrawHasUnboundStream = false;
+
 void CxbxVertexBufferConverter::ConvertStream
 (
     CxbxDrawContext *pDrawContext,
@@ -342,6 +353,11 @@ void CxbxVertexBufferConverter::ConvertStream
 				EmuLog(LOG_LEVEL::WARNING, "g_pD3DDevice->SetStreamSource(HostStreamNumber, nullptr, 0)");
 			}
 
+			// Clearing the stream is not enough on its own: the vertex declaration still
+			// references this stream, and drawing with a declared-but-unbound stream faults
+			// *inside* the host d3d9 runtime instead of returning D3DERR_INVALIDCALL. Flag
+			// it so the caller drops the draw.
+			g_bCxbxDrawHasUnboundStream = true;
 			return;
 		}
 
@@ -423,6 +439,35 @@ void CxbxVertexBufferConverter::ConvertStream
 	if (dwHostVertexDataSize == 0) {
 		LOG_TEST_CASE("Attempted to use a 0 sized vertex stream");
 		return;
+	}
+
+	// dwHostVertexDataSize above is a 32-bit multiply of two values that come,
+	// indirectly, from the title. When a draw is malformed - a bad vertex
+	// declaration, a garbage count - that product OVERFLOWS, a far too small
+	// buffer is allocated, and the conversion loop below then writes
+	// uiVertexCount whole vertices into it. That is a heap overrun, and it
+	// faults inside ConvertStream rather than anywhere near the actual mistake.
+	//
+	// Observed on the Oddworld Stranger's Wrath May 2004 build: an access
+	// violation WRITING to 0x14016278 from
+	// HLE_draw_inline_elements -> CxbxDrawIndexed -> Apply -> ConvertStream.
+	//
+	// Recompute in 64-bit and refuse the conversion if it does not agree, or if
+	// the result is implausibly large. Dropping one stream loses that geometry
+	// but leaves the rest of the frame intact.
+	{
+		const uint64_t ui64RequiredSize = (uint64_t)uiVertexCount * (uint64_t)uiHostVertexStride;
+		// 256 MB is far beyond any legitimate single Xbox vertex stream - the
+		// console only had 64 MB of unified memory in total.
+		const uint64_t ui64SaneLimit = 256ull * 1024 * 1024;
+		if (ui64RequiredSize != (uint64_t)dwHostVertexDataSize || ui64RequiredSize > ui64SaneLimit) {
+			EmuLog(LOG_LEVEL::WARNING,
+				"Refusing malformed vertex stream: %u verts x %u stride = %llu bytes "
+				"(32-bit size says %u) - skipping this draw",
+				uiVertexCount, uiHostVertexStride,
+				(unsigned long long)ui64RequiredSize, dwHostVertexDataSize);
+			return;
+		}
 	}
 
     // Allocate new buffers
@@ -678,9 +723,15 @@ void CxbxVertexBufferConverter::ConvertStream
 	patchedStream.Activate(pDrawContext, HostStreamNumber);
 }
 
+bool CxbxDrawHasUnboundStream()
+{
+	return g_bCxbxDrawHasUnboundStream;
+}
+
 void CxbxVertexBufferConverter::Apply(CxbxDrawContext *pDrawContext)
 {
 	PERF_SCOPE(PERF_CAT_VTX_CONVERT);
+	g_bCxbxDrawHasUnboundStream = false;
 	if ((pDrawContext->XboxPrimitiveType < xbox::X_D3DPT_POINTLIST) || (pDrawContext->XboxPrimitiveType > xbox::X_D3DPT_POLYGON))
 		CxbxrAbort("Unknown primitive type: 0x%.02X\n", pDrawContext->XboxPrimitiveType);
 

@@ -1614,6 +1614,24 @@ bool EmuX86_Opcode_XOR(LPEXCEPTION_POINTERS e, _DInst& info)
 	return true;
 }
 
+// distorm always reads codeLen bytes from Eip, so it faults whenever Eip is not
+// backed by committed memory - which is exactly the case when a title jumps
+// through a bad function pointer. We reach here from inside the exception handler,
+// so that second fault is unrecoverable: the process is killed with no log at all,
+// and the only surviving evidence is a Windows Error Reporting entry pointing at
+// distorm's decode_internal. Guard the read so a bad Eip is reported instead.
+// (This also covers a valid Eip sitting within 20 bytes of the end of a mapping.)
+static bool EmuX86_DistormDecodeGuarded(_CodeInfo *ci, _DInst *info, unsigned int *count)
+{
+	__try {
+		distorm_decompose(ci, info, /*maxInstructions=*/1, count);
+		return true;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		return false;
+	}
+}
+
 bool EmuX86_DecodeOpcode(const uint8_t *Eip, _DInst &info)
 {
 	unsigned int decodedInstructionsCount = 0;
@@ -1628,7 +1646,12 @@ bool EmuX86_DecodeOpcode(const uint8_t *Eip, _DInst &info)
 	// Checking for DECRES_SUCCESS won't work, since we're passing distorm_decompose
 	// a codeLen big enough to decode any instruction-length, plus distorm doesn't
 	// halt cleanly after reaching maxInstructions 1. So instead, just call distorm :
-	distorm_decompose(&ci, &info, /*maxInstructions=*/1, &decodedInstructionsCount);
+	if (!EmuX86_DistormDecodeGuarded(&ci, &info, &decodedInstructionsCount)) {
+		EmuLog(LOG_LEVEL::WARNING, "Cannot read instruction bytes at 0x%08X - "
+			"Eip is not mapped (bad jump / call through a null or wild pointer)",
+			(unsigned)(uintptr_t)Eip);
+		return false;
+	}
 	// and check if it successfully decoded one instruction :
 	return (decodedInstructionsCount == 1);
 }

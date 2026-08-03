@@ -326,15 +326,46 @@ void InitSoftwareInterrupts()
 }
 #endif
 
-void MapThunkTable(uint32_t* kt, uint32_t* pThunkTable)
+// Rewrites a title's import thunk table in place: every entry arrives as
+// 0x80000000|ordinal and leaves as the address of our implementation.
+//
+// The ordinal comes straight out of the XBE and is therefore untrusted - it can
+// name an export we have no entry for. Reading past the end of pThunkTable is not
+// a harmless mistake: whatever follows in .data gets written into the title's own
+// import slot, and the title then CALLs it. That is a jump to an arbitrary address
+// with no diagnostics, and the resulting crash points at wherever the title
+// happened to call from rather than at the missing import.
+// Test case: all three 2004 Stranger's Wrath builds import xbdm ordinal 75
+// (DmQueryMemoryStatistics), which used to be three entries past the end of
+// Cxbx_LibXbdmThunkTable - they died on "call dword ptr [thunk]" with EIP = 1.
+void MapThunkTable(uint32_t* kt, uint32_t* pThunkTable, size_t ThunkTableCount, const char* LibName)
 {
     const bool SendDebugReports = (pThunkTable == CxbxKrnl_KernelThunkTable) && CxbxDebugger::CanReport();
 
 	uint32_t* kt_tbl = (uint32_t*)kt;
 	int i = 0;
 	while (kt_tbl[i] != 0) {
-		int t = kt_tbl[i] & 0x7FFFFFFF;
+		size_t t = kt_tbl[i] & 0x7FFFFFFF;
+		if (t >= ThunkTableCount) {
+			EmuLogInit(LOG_LEVEL::ERROR2,
+				"%s ordinal %u is imported by this title but is beyond our thunk table "
+				"(highest known is %u). Calling it will fail - add an entry for it.",
+				LibName, (unsigned)t, (unsigned)(ThunkTableCount - 1));
+			// Leave the slot pointing at nothing rather than at out-of-bounds
+			// memory, so the failure names itself instead of jumping into the weeds.
+			kt_tbl[i] = 0;
+			i++;
+			continue;
+		}
 		kt_tbl[i] = pThunkTable[t];
+		if (kt_tbl[i] < 0x10000) {
+			// The table marks exports we know of but have not implemented by
+			// storing the bare ordinal (see the PANIC entries). Say so now, while
+			// we still know which import it was.
+			EmuLogInit(LOG_LEVEL::WARNING,
+				"%s ordinal %u has no implementation - the title will crash if it calls it.",
+				LibName, (unsigned)t);
+		}
         if (SendDebugReports) {
             // TODO: Update CxbxKrnl_KernelThunkTable to include symbol names
             std::string importName = "KernelImport_" + std::to_string(t);
@@ -357,7 +388,8 @@ void ImportLibraries(XbeImportEntry *pImportDirectory)
 		std::wstring LibName = std::wstring((wchar_t*)pImportDirectory->LibNameAddr);
 
 		if (LibName == L"xbdm.dll") {
-			MapThunkTable((uint32_t *)pImportDirectory->ThunkAddr, Cxbx_LibXbdmThunkTable);
+			MapThunkTable((uint32_t *)pImportDirectory->ThunkAddr, Cxbx_LibXbdmThunkTable,
+				ARRAYSIZE(Cxbx_LibXbdmThunkTable), "xbdm.dll");
 		}
 		else {
 			// TODO: replace wprintf to EmuLogInit, how?
@@ -406,6 +438,10 @@ FILE* CxbxrKrnlSetupVerboseLog(int BootFlags)
 		if (CxbxrKrnl_DebugMode == DM_FILE) {
 			// Peform clean write to kernel log for first boot. Unless multi-xbe boot occur then perform append to existing log.
 			FILE* krnlLog = freopen(CxbxrKrnl_DebugFileName.c_str(), ((BootFlags == DebugMode::DM_NONE) ? "wt" : "at"), stdout);
+			// A file stream is block-buffered, so a crash or ExitProcess throws
+			// away everything still in the buffer - which is exactly the run-up to
+			// the failure we are trying to diagnose. Flush each line instead.
+			g_LogFlushEveryLine = true;
 			// Append separator for better readability after reboot.
 			if (BootFlags != DebugMode::DM_NONE) {
 				std::cout << "\n------REBOOT------REBOOT------REBOOT------REBOOT------REBOOT------\n" << std::endl;
@@ -1194,10 +1230,13 @@ static void CxbxrKrnlInitHacks()
 	kt ^= XOR_KT_KEY[to_underlying(CxbxKrnl_Xbe->GetXbeType())];
 
 	// Process the Kernel thunk table to map Kernel function calls to their actual address :
-	MapThunkTable((uint32_t *)kt, CxbxKrnl_KernelThunkTable);
+	MapThunkTable((uint32_t *)kt, CxbxKrnl_KernelThunkTable,
+		ARRAYSIZE(CxbxKrnl_KernelThunkTable), "xboxkrnl.exe");
 
 	// Does this xbe import any other libraries?
 	if (CxbxKrnl_Xbe->m_Header.dwNonKernelImportDirAddr) {
+		// Wire xbdm up to the memory manager before its thunks can be called.
+		CxbxrInitXbdmHooks();
 		ImportLibraries((XbeImportEntry *)CxbxKrnl_Xbe->m_Header.dwNonKernelImportDirAddr);
 	}
 
