@@ -76,6 +76,24 @@ extern unsigned g_RenderStat_NullTextureStages;   // empty texture stages filled
 // structure, or nullptr when that field cannot be located or does not hold a mapped pointer.
 // See the definition in Direct3D9.cpp for how the field and the struct layout were proven.
 xbox::X_D3DVertexShader *CxbxrGetXboxCurrentVertexShader();
+// Mark a host texture stage as written by something other than CxbxUpdateHostTextures,
+// so its per-stage memo does not skip restoring the real texture.
+void CxbxInvalidateHostTextureStage(int stage);
+// Reads the current vertex shader program start address out of the Xbox device
+// structure. Returns false when the field cannot be located, so callers fall back
+// to g_Xbox_VertexShader_FunctionSlots_StartAddress.
+bool CxbxrGetXboxVertexShaderStartAddress(xbox::dword_xt *pAddress);
+
+// Reads NV2A transform-constant methods the title wrote directly into the push
+// buffer (bypassing every patched Direct3D entry point) into Cxbx's shadow
+// constant file. See the definition in Direct3D9.cpp - this is how this engine
+// uploads its skinning bone palette.
+void CxbxrDrainXboxPushBufferConstants();
+extern unsigned g_PushConst_Drains;
+extern unsigned g_PushConst_Registers;
+extern unsigned g_PushConst_Resyncs;
+extern unsigned g_PushConst_LastLoad;
+extern unsigned g_PushConst_MaxReg;
 
 extern D3DFORMAT g_HostTextureFormats[xbox::X_D3DTS_STAGECOUNT];
 

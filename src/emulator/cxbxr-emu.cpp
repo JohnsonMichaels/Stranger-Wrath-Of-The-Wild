@@ -196,6 +196,43 @@ DWORD WINAPI Emulate(unsigned int reserved_systems, blocks_reserved_t blocks_res
 		return EXIT_FAILURE;
 	}
 
+	// Headless (cxbxr-ldr.exe /load, no GUI) has NO CONSOLE, so every printf-based
+	// diagnostic in the emulator - RENDERSTATS, the opened-file census, the input
+	// binding report, the unhandled-exception location - writes to a handle that goes
+	// nowhere. Cxbx's own KrnlDebugLogFile does not cover this either, because in
+	// headless mode the debug settings never reach EmuShared. The result is a
+	// standalone build that cannot be diagnosed at all, which has already cost real
+	// time: the input diagnostics added to BindHostDevice produced no output on any
+	// run, and it was not obvious why.
+	//
+	// Redirect stdout to a file beside the emulator DLL when there is no console.
+	// This is unconditional and cheap - a few KB per session - and it is the only
+	// reason any of the above is visible in a shipped build.
+	// Redirect UNCONDITIONALLY. The first attempt guarded this on
+	// GetConsoleWindow() == nullptr, reasoning that a console meant printf was
+	// already visible - but Cxbx allocates a console for its own logging, so the
+	// guard was true, the redirect never ran, and the diagnostics still went
+	// nowhere the user could see. A console that exists but is never shown is worse
+	// than none: it silently swallows output. Always write the file.
+	{
+		char szLogPath[MAX_PATH] = {};
+		HMODULE hSelf = nullptr;
+		if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+				(LPCSTR)&Emulate, &hSelf)
+		 && GetModuleFileNameA(hSelf, szLogPath, MAX_PATH) > 0) {
+			char *pSlash = strrchr(szLogPath, '\\');
+			if (pSlash != nullptr) {
+				strcpy_s(pSlash + 1, MAX_PATH - (size_t)(pSlash + 1 - szLogPath), "diagnostics.txt");
+				FILE *pRedirected = nullptr;
+				if (freopen_s(&pRedirected, szLogPath, "w", stdout) == 0 && pRedirected != nullptr) {
+					setvbuf(stdout, nullptr, _IOLBF, 4096); // line buffered - survives a crash
+					printf("=== Stranger's Wrath Beta - diagnostics ===\n");
+					fflush(stdout);
+				}
+			}
+		}
+	}
+
 	CxbxKrnlEmulate(reserved_systems, blocks_reserved);
 
 	/*! cleanup shared memory */

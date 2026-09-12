@@ -241,6 +241,9 @@ FATX_SUPERBLOCK CxbxGetFatXSuperBlock(int partitionNumber)
 
 void NTAPI CxbxIoApcDispatcher(PVOID ApcContext, xbox::PIO_STATUS_BLOCK /*IoStatusBlock*/, xbox::ulong_xt Reserved)
 {
+	extern unsigned g_IoStat_ApcDelivered;
+	g_IoStat_ApcDelivered++;
+
 	CxbxIoDispatcherContext* cxbxContext = reinterpret_cast<CxbxIoDispatcherContext*>(ApcContext);
 	std::get<xbox::PIO_APC_ROUTINE>(*cxbxContext)(
 		std::get<LPVOID>(*cxbxContext),std::get<xbox::PIO_STATUS_BLOCK>(*cxbxContext), Reserved);

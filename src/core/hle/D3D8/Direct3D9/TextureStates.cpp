@@ -184,7 +184,13 @@ void XboxTextureStateConverter::Apply()
             DWORD PcValue = XboxValue;
 
             // If the state hasn't changed, skip setting it
-            auto lastState = &PreviousStates[XboxStage][State];
+            // Indexed by HOST stage, because that is the stage actually written
+            // below. Under the point-sprite override Xbox stage 3 is written to host
+            // stage 0; keying the shadow on XboxStage marks stage 3 clean while
+            // stage 0 is the one that changed, so host stage 0 keeps the particle
+            // stage's sampler and texture-stage state for every later draw, and host
+            // stage 3 is skipped entirely on the pass meant to give it its own.
+            auto lastState = &PreviousStates[HostStage][State];
             if (*lastState == XboxValue) {
                 continue;
             }
@@ -331,6 +337,10 @@ void XboxTextureStateConverter::Apply()
         // set the point sprites texture
         g_pD3DDevice->GetTexture(3, &pTexture);
         g_pD3DDevice->SetTexture(0, pTexture);
+        // We have just written host stage 0 behind CxbxUpdateHostTextures' back,
+        // and nothing here restores it. Tell that function so its per-stage memo
+        // does not skip putting the real texture back on the next draw.
+        CxbxInvalidateHostTextureStage(0);
 
         // Avoid a dangling reference that would lead to a memory leak
         if (pTexture != nullptr)
@@ -339,6 +349,10 @@ void XboxTextureStateConverter::Apply()
         // disable all other stages
         g_pD3DDevice->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
         g_pD3DDevice->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+        // Written behind the shadow's back - drop the entries so the next Apply
+        // restores them instead of believing stage 1 is already correct.
+        PreviousStates[1][xbox::X_D3DTSS_COLOROP].reset();
+        PreviousStates[1][xbox::X_D3DTSS_ALPHAOP].reset();
 
         // no need to actually copy here, since it was handled in the loop above
     }

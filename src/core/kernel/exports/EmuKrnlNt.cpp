@@ -1,4 +1,4 @@
-// This is an open source non-commercial project. Dear PVS-Studio, please check it.
+﻿// This is an open source non-commercial project. Dear PVS-Studio, please check it.
 // PVS-Studio Static Code Analyzer for C, C++ and C#: http://www.viva64.com
 // ******************************************************************
 // *
@@ -27,6 +27,13 @@
 // ******************************************************************
 
 #define LOG_PREFIX CXBXR_MODULE::NT
+
+
+#include <intrin.h> // _AddressOfReturnAddress, to name the guest code behind an object
+
+// The object diagnostics walk the EBP chain out of these functions into guest code,
+// which is only sound if the compiler actually keeps a frame pointer here.
+#pragma optimize("y", off)
 
 
 #include <core\kernel\exports\xboxkrnl.h> // For NtAllocateVirtualMemory, etc.
@@ -195,6 +202,7 @@ XBSYSAPI EXPORTNUM(187) xbox::ntstatus_xt NTAPI xbox::NtClose
 )
 {
 	LOG_FUNC_ONE_ARG(Handle);
+	CxbxrNoteFileOp("NtClose", (void *)Handle, 0, 0);
 
 	ntstatus_xt result = X_STATUS_SUCCESS;
 
@@ -327,6 +335,17 @@ XBSYSAPI EXPORTNUM(189) xbox::ntstatus_xt NTAPI xbox::NtCreateEvent
 		EmuLog(LOG_LEVEL::DEBUG, "NtCreateEvent EventHandle = 0x%.8X", *EventHandle);
 #endif
 
+	if (X_NT_SUCCESS(result) && EventHandle != nullptr) {
+		// _ReturnAddress() alone only names the XAPI wrapper (CreateEventA), which every
+		// event in the title shares. The chain above it is what distinguishes them.
+		char Callers[160];
+		CxbxrDescribeCallers(_AddressOfReturnAddress(), Callers, sizeof(Callers));
+		char Origin[224];
+		std::snprintf(Origin, sizeof(Origin), "NtCreateEvent(type=%d,initial=%d) callers=%s",
+			(int)EventType, (int)InitialState, Callers);
+		CxbxrNoteHandleOrigin((void *)*EventHandle, Origin);
+	}
+
 	RETURN(result);
 }
 
@@ -453,6 +472,10 @@ XBSYSAPI EXPORTNUM(192) xbox::ntstatus_xt NTAPI xbox::NtCreateMutant
 	else
 		EmuLog(LOG_LEVEL::DEBUG, "NtCreateMutant MutantHandle = 0x%.8X", *MutantHandle);
 
+	if (X_NT_SUCCESS(ret) && MutantHandle != nullptr) {
+		CxbxrNoteHandleOrigin((void *)*MutantHandle, "NtCreateMutant");
+	}
+
 	RETURN(ret);
 }
 
@@ -528,6 +551,13 @@ XBSYSAPI EXPORTNUM(193) xbox::ntstatus_xt NTAPI xbox::NtCreateSemaphore
 	else
 		EmuLog(LOG_LEVEL::DEBUG, "NtCreateSemaphore SemaphoreHandle = 0x%.8X", *SemaphoreHandle);
 
+	if (X_NT_SUCCESS(ret) && SemaphoreHandle != nullptr) {
+		char Origin[64];
+		std::snprintf(Origin, sizeof(Origin), "NtCreateSemaphore(initial=%d,max=%d)",
+			(int)InitialCount, (int)MaximumCount);
+		CxbxrNoteHandleOrigin((void *)*SemaphoreHandle, Origin);
+	}
+
 	RETURN(ret);
 }
 
@@ -587,6 +617,10 @@ XBSYSAPI EXPORTNUM(194) xbox::ntstatus_xt NTAPI xbox::NtCreateTimer
 		EmuLog(LOG_LEVEL::WARNING, "NtCreateTimer failed!");
 	else
 		EmuLog(LOG_LEVEL::DEBUG, "NtCreateTimer TimerHandle = 0x%.8X", *TimerHandle);
+
+	if (X_NT_SUCCESS(ret) && TimerHandle != nullptr) {
+		CxbxrNoteHandleOrigin((void *)*TimerHandle, "NtCreateTimer");
+	}
 
 	RETURN(ret);
 }
@@ -862,6 +896,7 @@ XBSYSAPI EXPORTNUM(196) xbox::ntstatus_xt NTAPI xbox::NtDeviceIoControlFile
 		LOG_FUNC_ARG_OUT(OutputBuffer)
 		LOG_FUNC_ARG(OutputBufferLength)
 		LOG_FUNC_END;
+	CxbxrNoteFileOp("NtDeviceIoControlFile", (void *)FileHandle, 0, 0);
 
 	/* Call the Generic Function */
 	ntstatus_xt result = IopDeviceFsIoControl(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, IoControlCode, InputBuffer, InputBufferLength, OutputBuffer, OutputBufferLength, true);
@@ -945,6 +980,7 @@ XBSYSAPI EXPORTNUM(198) xbox::ntstatus_xt NTAPI xbox::NtFlushBuffersFile
 		LOG_FUNC_ARG(FileHandle)
 		LOG_FUNC_ARG_OUT(IoStatusBlock)
 		LOG_FUNC_END;
+	CxbxrNoteFileOp("NtFlushBuffersFile", (void *)FileHandle, 0, 0);
 
 	/* Get the File Object */
 	PVOID Object;
@@ -1022,6 +1058,7 @@ XBSYSAPI EXPORTNUM(200) xbox::ntstatus_xt NTAPI xbox::NtFsControlFile
 		LOG_FUNC_ARG(OutputBuffer)
 		LOG_FUNC_ARG(OutputBufferLength)
 		LOG_FUNC_END;
+	CxbxrNoteFileOp("NtFsControlFile", (void *)FileHandle, 0, 0);
 
 	/* Call the Generic Function */
 	ntstatus_xt result = IopDeviceFsIoControl(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, FsControlCode, InputBuffer, InputBufferLength, OutputBuffer, OutputBufferLength, false);
@@ -1136,6 +1173,15 @@ XBSYSAPI EXPORTNUM(205) xbox::ntstatus_xt NTAPI xbox::NtPulseEvent
 
 	// redirect to Windows NT
 	// TODO : Untested
+	{
+		// Which code path signals this event matters as much as how often: a handshake
+		// that ran 55 times and then stopped is a producer that quit, not a missing
+		// implementation, and the producer's address names it.
+		char Callers[160];
+		CxbxrDescribeCallers(_AddressOfReturnAddress(), Callers, sizeof(Callers));
+		CxbxrNoteHandleSignalled((void *)EventHandle, Callers);
+	}
+
 	NTSTATUS ret = NtDll::NtPulseEvent(
 		EventHandle, 
 		/*OUT*/(::PLONG)(PreviousState));
@@ -1220,6 +1266,7 @@ XBSYSAPI EXPORTNUM(207) xbox::ntstatus_xt NTAPI xbox::NtQueryDirectoryFile
 		LOG_FUNC_ARG(FileMask)
 		LOG_FUNC_ARG(RestartScan)
 		LOG_FUNC_END;
+	CxbxrNoteFileOp("NtQueryDirectoryFile", (void *)FileHandle, 0, 0);
 
 	NTSTATUS ret;
 
@@ -1424,6 +1471,7 @@ XBSYSAPI EXPORTNUM(211) xbox::ntstatus_xt NTAPI xbox::NtQueryInformationFile
 		LOG_FUNC_ARG(Length)
 		LOG_FUNC_ARG(FileInformationClass)
 		LOG_FUNC_END;
+	CxbxrNoteFileOp("NtQueryInformationFile", (void *)FileHandle, 0, 0);
 
 	/* Validate the information class */
 	if ((FileInformationClass < 0) ||
@@ -1759,6 +1807,7 @@ XBSYSAPI EXPORTNUM(218) xbox::ntstatus_xt NTAPI xbox::NtQueryVolumeInformationFi
 		LOG_FUNC_ARG(Length)
 		LOG_FUNC_ARG(FileInformationClass)
 		LOG_FUNC_END;
+	CxbxrNoteFileOp("NtQueryVolumeInformationFile", (void *)FileHandle, 0, 0);
 
 	/* Validate the information class */
 	if ((FileInformationClass < 0) ||
@@ -1918,6 +1967,21 @@ XBSYSAPI EXPORTNUM(218) xbox::ntstatus_xt NTAPI xbox::NtQueryVolumeInformationFi
 // ******************************************************************
 // * 0x00DB - NtReadFile()
 // ******************************************************************
+
+// Async file I/O accounting.
+//
+// Loading Mongo Valley (region_03) wedges: file activity stops dead after
+// npc_15.smb, no further opens ever happen, yet the render loop keeps running and
+// draws exactly one thing per frame (the loading screen). No crash, no stall - the
+// LOADER is waiting on something. The obvious candidate is an asynchronous read
+// whose completion never arrives, so count issues against completions. If issued
+// keeps climbing while completed lags and then both freeze, the wedge is here.
+unsigned g_IoStat_Reads = 0;
+unsigned g_IoStat_ReadsAsync = 0;
+unsigned g_IoStat_ReadsPending = 0;
+unsigned g_IoStat_ReadsWithEvent = 0;
+unsigned g_IoStat_ApcDelivered = 0;   // incremented in CxbxIoApcDispatcher
+
 XBSYSAPI EXPORTNUM(219) xbox::ntstatus_xt NTAPI xbox::NtReadFile
 (
 	IN  HANDLE          FileHandle,            // TODO: correct paramters
@@ -1978,6 +2042,13 @@ XBSYSAPI EXPORTNUM(219) xbox::ntstatus_xt NTAPI xbox::NtReadFile
 		RETURN(X_STATUS_ACCESS_DENIED);
 	}
 #endif
+
+	g_IoStat_Reads++;
+	if (ApcRoutine != nullptr) { g_IoStat_ReadsAsync++; }
+	if (Event != nullptr) { g_IoStat_ReadsWithEvent++; }
+
+	CxbxrNoteFileOp("NtReadFile", (void *)FileHandle,
+		ByteOffset ? (unsigned long long)ByteOffset->QuadPart : ~0ull, (unsigned)Length);
 
 	if (ApcRoutine != nullptr) {
 		// Pack the original parameters to a wrapped context for a custom APC routine
@@ -2162,6 +2233,15 @@ XBSYSAPI EXPORTNUM(225) xbox::ntstatus_xt NTAPI xbox::NtSetEvent
 		LOG_FUNC_ARG_OUT(PreviousState)
 		LOG_FUNC_END;
 
+	{
+		// Which code path signals this event matters as much as how often: a handshake
+		// that ran 55 times and then stopped is a producer that quit, not a missing
+		// implementation, and the producer's address names it.
+		char Callers[160];
+		CxbxrDescribeCallers(_AddressOfReturnAddress(), Callers, sizeof(Callers));
+		CxbxrNoteHandleSignalled((void *)EventHandle, Callers);
+	}
+
 	NTSTATUS ret = NtDll::NtSetEvent(
 		EventHandle, 
 		(::PLONG)(PreviousState));
@@ -2291,6 +2371,7 @@ XBSYSAPI EXPORTNUM(226) xbox::ntstatus_xt NTAPI xbox::NtSetInformationFile
 		LOG_FUNC_ARG(Length)
 		LOG_FUNC_ARG(FileInformationClass)
 		LOG_FUNC_END;
+	CxbxrNoteFileOp("NtSetInformationFile", (void *)FileHandle, 0, 0);
 
 	PFILE_OBJECT FileObjectSource;
 	ntstatus_xt result = ObReferenceObjectByHandle(FileHandle, &IoFileObjectType, reinterpret_cast<PVOID*>(&FileObjectSource));
@@ -2683,6 +2764,12 @@ XBSYSAPI EXPORTNUM(235) xbox::ntstatus_xt NTAPI xbox::NtWaitForMultipleObjectsEx
 	IN  PLARGE_INTEGER  Timeout
 )
 {
+	// Record what this thread is about to wait on, so an unsatisfiable infinite wait
+	// inside WaitApc can name the object instead of only reporting that it is stuck.
+	g_WaitDiagObject = (Handles != nullptr && Count > 0) ? (void *)Handles[0] : nullptr;
+	g_WaitDiagCount = (unsigned)Count;
+	CxbxrDescribeCallers(_AddressOfReturnAddress(), g_WaitDiagCallers, sizeof(g_WaitDiagCallers));
+
 	LOG_FUNC_BEGIN
 		LOG_FUNC_ARG(Count)
 		LOG_FUNC_ARG(Handles)
@@ -2703,10 +2790,12 @@ XBSYSAPI EXPORTNUM(235) xbox::ntstatus_xt NTAPI xbox::NtWaitForMultipleObjectsEx
 		if (const auto &nativeHandle = GetNativeHandle(Handles[i])) {
 			// This is a ob handle, so replace it with its native counterpart
 			nativeHandles[i] = *nativeHandle;
+			if (i == 0) { g_WaitDiagNative = nativeHandles[0]; g_WaitDiagIsOb = true; }
 			EmuLog(LOG_LEVEL::DEBUG, "xbox handle: %p", nativeHandles[i]);
 		}
 		else {
 			nativeHandles[i] = Handles[i];
+			if (i == 0) { g_WaitDiagNative = nativeHandles[0]; g_WaitDiagIsOb = false; }
 			EmuLog(LOG_LEVEL::DEBUG, "native handle: %p", nativeHandles[i]);
 		}
 	}

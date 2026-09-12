@@ -29,11 +29,13 @@
 #define LOG_PREFIX CXBXR_MODULE::IO
 
 
+#include <set> // For the opened-file census in IoCreateFile
 #include <core\kernel\exports\xboxkrnl.h> // For IoCompletionObjectType, etc.
 #include "EmuKrnlIo.hpp"
 #include "EmuKrnlNt.hpp"
 #include "Logging.h" // For LOG_FUNC()
 #include "EmuKrnlLogging.h"
+#include "EmuKrnl.h" // CxbxrNoteFileOpened
 #include "core\kernel\init\CxbxKrnl.h" // For CxbxrAbort
 #include "core\kernel\support\Emu.h" // For EmuLog(LOG_LEVEL::WARNING, )
 #include "core\kernel\support\EmuFile.h" // For CxbxCreateSymbolicLink(), etc.
@@ -415,6 +417,22 @@ XBSYSAPI EXPORTNUM(66) xbox::ntstatus_xt NTAPI xbox::IoCreateFile
 		LOG_FUNC_ARG(Options)
 		LOG_FUNC_END;
 
+	// Census of every distinct path the title opens. Full file logging on this
+	// title produces hundreds of megabytes in seconds, which is unusable; printing
+	// each path only the FIRST time it is seen is bounded by the game's asset count
+	// and answers "does it ever touch this file?" directly. Both NtCreateFile and
+	// NtOpenFile forward here, so this one point sees every open.
+	std::string OpenedPath;
+	if (ObjectAttributes && ObjectAttributes->ObjectName && ObjectAttributes->ObjectName->Buffer) {
+		OpenedPath.assign(ObjectAttributes->ObjectName->Buffer, ObjectAttributes->ObjectName->Length);
+		// Counting rather than de-duplicating: a path opened hundreds of times is a
+		// retry loop, and a retry loop beside a stalled loader is the thing to look
+		// at. The first sighting still prints, so the census itself is unchanged.
+		if (CxbxrNoteFileOpenAttempt(OpenedPath.c_str()) == 1) {
+			printf("FILEOPEN: %s\n", OpenedPath.c_str());
+		}
+	}
+
 	// TODO: This may need removal and use actual driver for Chihiro.
 	//       Check if there's another branch has chihiro support somewhere? I think nope.
 	// If we are emulating the Chihiro, we need to hook mbcom, so return an easily identifiable handle
@@ -598,6 +616,26 @@ XBSYSAPI EXPORTNUM(66) xbox::ntstatus_xt NTAPI xbox::IoCreateFile
 		LOG_FUNC_BEGIN_ARG_RESULT
 			LOG_FUNC_ARG_RESULT(FileHandle)
 		LOG_FUNC_END_ARG_RESULT;
+
+		// Pair the handle with its path so a read can be reported by name later.
+		if (!OpenedPath.empty()) {
+			CxbxrNoteFileOpened((void *)*FileHandle, OpenedPath.c_str());
+		}
+	}
+
+	// An open that succeeds but is never read from is the shape of the level-load
+	// wedge, so report the outcome for the bundles involved. Every other open is
+	// silent - full open logging on this title is unusable.
+	if (!OpenedPath.empty()
+	 && (OpenedPath.find("npc_") != std::string::npos
+	  || OpenedPath.find("character") != std::string::npos
+	  || OpenedPath.find("anim") != std::string::npos
+	  || OpenedPath.find(".sav") != std::string::npos
+	  || OpenedPath.find("metadata") != std::string::npos)) {
+		printf("FILEOPENRESULT: %s -> status=0x%08X handle=%p\n",
+			OpenedPath.c_str(), (unsigned)result,
+			X_NT_SUCCESS(result) ? (void *)*FileHandle : nullptr);
+		fflush(stdout);
 	}
 
 	RETURN(result);

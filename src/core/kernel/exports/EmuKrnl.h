@@ -137,6 +137,39 @@ std::optional<xbox::ntstatus_xt> SatisfyWait(T &&Lambda, xbox::PKTHREAD kThread,
 	return std::nullopt;
 }
 
+// What the current thread is waiting on, recorded by NtWaitForMultipleObjectsEx so
+// the infinite-wait diagnostic in WaitApc can NAME the object rather than only
+// reporting that something is stuck.
+inline thread_local void *g_WaitDiagObject = nullptr;   // guest handle
+inline thread_local void *g_WaitDiagNative = nullptr;   // host handle after conversion
+inline thread_local bool g_WaitDiagIsOb = false;        // set when the guest handle was an ob handle
+inline thread_local unsigned g_WaitDiagCount = 0;
+inline thread_local char g_WaitDiagCallers[160] = {};  // guest frames above the wait
+
+// Knowing that a wait is stuck is only half an answer - the other half is WHICH
+// object, and every handle the guest can wait on came out of a kernel export we
+// control. Each of those records where it handed the handle out, so a bare number
+// like 0x698 turns back into "Event(Synchronization,initial=0) NtCreateEvent".
+void CxbxrNoteHandleOrigin(void *Handle, const char *Origin);
+void CxbxrForgetHandle(void *Handle);
+void CxbxrNoteHandleSignalled(void *Handle, const char *Callers);
+// Pass _AddressOfReturnAddress(); formats the guest EBP chain above the caller.
+void CxbxrDescribeCallers(void *AddressOfReturnAddress, char *Buffer, size_t BufferSize);
+const char *CxbxrDescribeHandle(void *Handle); // never null
+
+// Where the loader had got to when it stopped. Guest code is FPO-compiled, so its
+// stack cannot be walked; the file it was reading identifies the subsystem instead.
+void CxbxrNoteFileOpened(void *FileHandle, const char *Path);
+void CxbxrNoteFileOp(const char *Op, void *FileHandle, unsigned long long Offset, unsigned Length);
+void CxbxrPrintReadTrail(void);
+unsigned CxbxrNoteFileOpenAttempt(const char *Path); // returns the new count
+void CxbxrPrintOpenCounts(void);
+// Which guest threads exist and which have died - the thread that stopped queuing
+// work is the one to find, and a dead thread cannot queue anything.
+void CxbxrNoteThreadStarted(unsigned ThreadId, unsigned StartAddress, unsigned Context);
+void CxbxrNoteThreadExited(unsigned ThreadId, unsigned ExitStatus);
+void CxbxrPrintThreadCensus(void);
+
 template<bool host_wait, typename T>
 xbox::ntstatus_xt WaitApc(T &&Lambda, xbox::PLARGE_INTEGER Timeout, xbox::boolean_xt Alertable, xbox::char_xt WaitMode, xbox::PKTHREAD kThread)
 {
@@ -146,10 +179,37 @@ xbox::ntstatus_xt WaitApc(T &&Lambda, xbox::PLARGE_INTEGER Timeout, xbox::boolea
 	xbox::ntstatus_xt status;
 	if (Timeout == nullptr) {
 		// No timout specified, so this is an infinite wait until an alert, a user apc or the object(s) become(s) signalled
+		//
+		// A guest thread parked here forever is how loading region_03 (Mongo Valley)
+		// wedges: the game calls WaitForSingleObject on an object that is never
+		// signalled, so the loader stops while the renderer keeps drawing the loading
+		// screen. Nothing errors and nothing crashes - it simply waits. Report it, so
+		// an unsatisfiable wait names itself instead of looking like a hang.
+		unsigned long long Spins = 0;
+		const DWORD WaitStartTick = GetTickCount();
 		while (true) {
 			if (const auto ret = SatisfyWait(Lambda, kThread, Alertable, WaitMode)) {
 				status = *ret;
 				break;
+			}
+
+			// ~1s, then every ~5s. Cheap: only a stuck wait ever reaches the print.
+			if ((++Spins & 0xFFFFF) == 0) {
+				const DWORD Waited = GetTickCount() - WaitStartTick;
+				if (Waited > 1000) {
+					static thread_local DWORD s_LastReport = 0;
+					if (Waited - s_LastReport > 5000) {
+						s_LastReport = Waited;
+						printf("WAIT: thread %u blocked %u ms in an INFINITE wait "
+							"(alertable=%d waitMode=%d) object=%p count=%u -- %s%s\n",
+							(unsigned)GetCurrentThreadId(), (unsigned)Waited,
+							(int)Alertable, (int)WaitMode, g_WaitDiagObject, g_WaitDiagCount,
+							g_WaitDiagIsOb ? "ob handle -> " : "",
+							CxbxrDescribeHandle(g_WaitDiagIsOb ? g_WaitDiagNative : g_WaitDiagObject));
+						printf("WAIT:   waiter called from %s\n", g_WaitDiagCallers);
+						fflush(stdout);
+					}
+				}
 			}
 
 			std::this_thread::yield();

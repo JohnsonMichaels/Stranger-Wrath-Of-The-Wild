@@ -60,6 +60,46 @@ ShaderKey VertexShaderCache::CreateShader(const xbox::dword_xt* pXboxFunction, D
 	// Parse into intermediate format
 	EmuParseVshFunction((DWORD*)pXboxFunction, &intermediateShader);
 
+	// Dump the Xbox microcode of every distinct skinning program (one that reads vertex
+	// register 1 - bone indices in .xy and weights in .zw for this title), together with
+	// the instructions that write one result to both a temporary and an output register.
+	// printf, not EmuLog : EmuLog produces nothing with LoggedModules=0x0, and a shipped
+	// build routes stdout to diagnostics.txt beside cxbxr-emu.dll.
+	// This runs once per distinct program - the cache lookup above already returned for repeats.
+	// The translated HLSL for the same program is written to ShaderCache\<title>\Dumped\.
+	{
+		bool bReadsVertexRegister1 = false;
+		for (const auto& in : intermediateShader.Instructions) {
+			for (int p = 0; p < in.MAC.ParamCount; p++) {
+				if (in.MAC.Parameters[p].Type == PARAM_V && in.MAC.Parameters[p].Address == 1) bReadsVertexRegister1 = true;
+			}
+			if (in.ILU.Opcode != ILU_NOP && in.ILU.Parameter.Type == PARAM_V && in.ILU.Parameter.Address == 1) bReadsVertexRegister1 = true;
+		}
+
+		if (bReadsVertexRegister1) {
+			const unsigned nrTokens = *pXboxFunctionSize / sizeof(DWORD);
+			const uint32_t* pTokens = (const uint32_t*)pXboxFunction;
+			printf("VSHDUMP: key=%016llx bytes=%u tokens=%u instructions=%u (reads v1)\n",
+				(unsigned long long)key, (unsigned)*pXboxFunctionSize, nrTokens, (unsigned)intermediateShader.Instructions.size());
+			for (unsigned t = 0; t + 3 < nrTokens; t += 4) {
+				printf("VSHDUMP:   %02u : %08X %08X %08X %08X\n", t / 4, pTokens[t], pTokens[t + 1], pTokens[t + 2], pTokens[t + 3]);
+			}
+			unsigned n = 0;
+			for (const auto& in : intermediateShader.Instructions) {
+				if (in.MAC.Opcode != MAC_NOP && in.MAC.Dest.Mask && in.ORegSource == SRC_MAC && in.ORegDest.Mask) {
+					printf("VSHDUMP:   instr %02u : MAC op %d writes BOTH r%d(mask %X) and o%d(mask %X)\n",
+						n, (int)in.MAC.Opcode, (int)in.MAC.Dest.Address, in.MAC.Dest.Mask, (int)in.ORegDest.Address, in.ORegDest.Mask);
+				}
+				if (in.ILU.Opcode != ILU_NOP && in.ILU.Dest.Mask && in.ORegSource == SRC_ILU && in.ORegDest.Mask) {
+					printf("VSHDUMP:   instr %02u : ILU op %d writes BOTH r%d(mask %X) and o%d(mask %X)\n",
+						n, (int)in.ILU.Opcode, (int)in.ILU.Dest.Address, in.ILU.Dest.Mask, (int)in.ORegDest.Address, in.ORegDest.Mask);
+				}
+				n++;
+			}
+			fflush(stdout);
+		}
+	}
+
 	// We're going to create a new shader
 	auto newShader = LazyVertexShader();
 	newShader.referenceCount = 1;

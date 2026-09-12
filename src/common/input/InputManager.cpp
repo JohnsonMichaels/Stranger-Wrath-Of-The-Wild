@@ -354,6 +354,24 @@ void InputDeviceManager::BindHostDevice(int type, std::string_view port)
 		std::string port_str(port);
 		dev->ClearBindings(port_str);
 		std::vector<InputDevice::IoControl *> controls = dev->GetIoControls();
+
+		// Bindings are resolved by EXACT string match against a control's name, and a
+		// name that does not match is silently bound to nullptr - the control simply
+		// never responds, with nothing logged. That is indistinguishable from the
+		// emulator ignoring your mouse. Print what the device actually offers, and
+		// every binding that failed to resolve, so a typo or a missing control is
+		// visible. printf, not EmuLog: this title runs with LoggedModules = 0x0,
+		// under which EmuLog produces nothing at all.
+		static bool s_bListedControls = false;
+		if (!s_bListedControls) {
+			s_bListedControls = true;
+			printf("INPUT: device '%s' offers %u controls:\n", dev_name, (unsigned)controls.size());
+			for (const auto control : controls) {
+				printf("INPUT:   [%s]\n", control->GetName().c_str());
+			}
+			fflush(stdout);
+		}
+
 		for (int index = 0; index < dev_num_buttons[type]; index++) {
 			std::string dev_button(dev_control_names[index]);
 			auto it = std::find_if(controls.begin(), controls.end(), [&dev_button](const auto control) {
@@ -362,6 +380,11 @@ void InputDeviceManager::BindHostDevice(int type, std::string_view port)
 				}
 				return false;
 				});
+			if (it == controls.end() && !dev_button.empty()) {
+				printf("INPUT: UNRESOLVED binding [%s] - no control of that name on this device\n",
+					dev_button.c_str());
+				fflush(stdout);
+			}
 			dev->SetBindings(index, (it != controls.end()) ? *it : nullptr, port_str);
 		}
 		dev->SetPort2(port, true);

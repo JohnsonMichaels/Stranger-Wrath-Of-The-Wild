@@ -35,6 +35,12 @@
 #include <cstdio>
 #include <cctype>
 #include <clocale>
+#include <cstring>
+#include <map>
+#include <mutex>
+#include <string>
+#include <vector>
+#include <algorithm>
 
 #include "Logging.h"
 #include "EmuKrnlLogging.h"
@@ -715,4 +721,363 @@ XBSYSAPI EXPORTNUM(373) xbox::ntstatus_xt NTAPI xbox::IrtSweep // PROFILING
 	LOG_UNIMPLEMENTED();
 
 	RETURN(S_OK);
+}
+
+// ******************************************************************
+// * Handle origin registry (Cxbx-R fork diagnostic)
+// ******************************************************************
+// A guest thread that waits forever tells us nothing by itself - the handle is a
+// bare number. But every handle the guest can wait on left one of our own kernel
+// exports, so each of those records what it created. Pairing that with a live
+// NtQueryObject/NtQueryEvent probe turns "object=00000698" into a named object with
+// a signal state, which is the difference between a hang and a diagnosis.
+
+
+// The guest is 32-bit MSVC 7 code that keeps a frame pointer, so an EBP chain walk
+// gives real callers. _ReturnAddress() alone only reaches the XAPI wrapper
+// (CreateEventA, SetEvent, ...) - the interesting frame is always the one above it.
+static void CxbxrFormatGuestCallers(void *Ebp, char *Buffer, size_t BufferSize, unsigned MaxFrames)
+{
+	Buffer[0] = '\0';
+	size_t Used = 0;
+	struct Frame { Frame *Next; void *Return; };
+	const Frame *pFrame = (const Frame *)Ebp;
+
+	for (unsigned i = 0; i < MaxFrames && pFrame != nullptr; ++i) {
+		if (::IsBadReadPtr(pFrame, sizeof(Frame))) {
+			break;
+		}
+		void *const Return = pFrame->Return;
+		if (Return == nullptr) {
+			break;
+		}
+		// Only guest frames are worth naming: a host module here is our own kernel
+		// code on the way in, which the caller already knows about.
+		HMODULE hModule = nullptr;
+		const bool bHost = ::GetModuleHandleExA(
+			GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			(LPCSTR)Return, &hModule) && hModule != nullptr;
+		if (!bHost) {
+			const int Written = std::snprintf(Buffer + Used, BufferSize - Used,
+				Used == 0 ? "0x%08X" : "<-0x%08X", (unsigned)(uintptr_t)Return);
+			if (Written <= 0 || (size_t)Written >= BufferSize - Used) {
+				break;
+			}
+			Used += Written;
+		}
+		if (pFrame->Next <= pFrame) {
+			break; // stacks grow down; anything else is not a frame chain
+		}
+		pFrame = pFrame->Next;
+	}
+}
+
+// Turn a kernel export's own frame into the start of an EBP chain. With a standard
+// x86 prologue (push ebp; mov ebp,esp) the return address sits at [ebp+4] and the
+// caller's saved ebp at [ebp+0], so _AddressOfReturnAddress()[-1] IS the caller's
+// frame pointer. Callers must be compiled frame-pointer-full (#pragma optimize("y",off))
+// for that to hold; the walk validates every link and prints nothing rather than
+// guessing, because a stack walk that invents plausible callers is worse than none -
+// this project already lost time to one that did.
+void CxbxrDescribeCallers(void *AddressOfReturnAddress, char *Buffer, size_t BufferSize)
+{
+	void *const CallerEbp = ((void **)AddressOfReturnAddress)[-1];
+	// A frame pointer must lie above us on the stack and be pointer-aligned.
+	if (CallerEbp <= AddressOfReturnAddress || (((uintptr_t)CallerEbp) & 3) != 0) {
+		std::snprintf(Buffer, BufferSize, "<no frame chain>");
+		return;
+	}
+	CxbxrFormatGuestCallers(CallerEbp, Buffer, BufferSize, 8);
+	if (Buffer[0] == '\0') {
+		std::snprintf(Buffer, BufferSize, "<no guest frames>");
+	}
+}
+
+static std::mutex g_HandleOriginMtx;
+static std::map<void *, std::string> g_HandleOrigin;
+// "Nobody ever set it" is a much stronger statement than "it is not set right now" -
+// a synchronisation event that was set and consumed reads as unsignalled too.
+struct HandleSignalRecord { unsigned Count; std::string LastCallers; };
+static std::map<void *, HandleSignalRecord> g_HandleSignalCount;
+
+void CxbxrNoteHandleOrigin(void *Handle, const char *Origin)
+{
+	if (Handle == nullptr || Origin == nullptr) {
+		return;
+	}
+	std::lock_guard<std::mutex> lock(g_HandleOriginMtx);
+	// Handles get recycled, so the newest creator always wins.
+	g_HandleOrigin[Handle] = Origin;
+}
+
+void CxbxrForgetHandle(void *Handle)
+{
+	if (Handle == nullptr) {
+		return;
+	}
+	std::lock_guard<std::mutex> lock(g_HandleOriginMtx);
+	g_HandleOrigin.erase(Handle);
+	g_HandleSignalCount.erase(Handle);
+}
+
+void CxbxrNoteHandleSignalled(void *Handle, const char *Callers)
+{
+	if (Handle == nullptr) {
+		return;
+	}
+	std::lock_guard<std::mutex> lock(g_HandleOriginMtx);
+	HandleSignalRecord &Record = g_HandleSignalCount[Handle];
+	Record.Count++;
+	if (Callers != nullptr) {
+		Record.LastCallers = Callers;
+	}
+}
+
+const char *CxbxrDescribeHandle(void *Handle)
+{
+	// One buffer per calling thread: the caller prints it immediately, and the only
+	// callers are diagnostics that fire at most once every few seconds.
+	static thread_local char Description[768];
+
+	std::string Origin;
+	std::string LastSignaller;
+	unsigned Signals = 0;
+	{
+		std::lock_guard<std::mutex> lock(g_HandleOriginMtx);
+		const auto it = g_HandleOrigin.find(Handle);
+		if (it != g_HandleOrigin.end()) {
+			Origin = it->second;
+		}
+		const auto sit = g_HandleSignalCount.find(Handle);
+		if (sit != g_HandleSignalCount.end()) {
+			Signals = sit->second.Count;
+			LastSignaller = sit->second.LastCallers;
+		}
+	}
+	if (Origin.empty()) {
+		Origin = "not created by any kernel export we track";
+	}
+
+	// Ask the host what the object actually is right now. The type name settles
+	// whether we are looking at an event, a thread that never exited, or something
+	// else entirely; for events the signal state says whether anyone ever set it.
+	char TypeName[64] = "?";
+	char State[80] = "";
+
+	// NtQueryObject is not in the emulator's ntdll wrapper set, so resolve it once.
+	// ObjectTypeInformation (2) yields an OBJECT_TYPE_INFORMATION whose first member
+	// is a UNICODE_STRING naming the type: "Event", "Thread", "Semaphore", ...
+	typedef LONG(NTAPI * FPTR_NtQueryObject)(::HANDLE, ULONG, PVOID, ULONG, PULONG);
+	static FPTR_NtQueryObject pNtQueryObject = []() -> FPTR_NtQueryObject {
+		if (const HMODULE Ntdll = ::GetModuleHandleA("ntdll.dll")) {
+			return (FPTR_NtQueryObject)::GetProcAddress(Ntdll, "NtQueryObject");
+		}
+		return nullptr;
+	}();
+
+	if (pNtQueryObject != nullptr) {
+		alignas(8) unsigned char Buffer[1024] = {};
+		ULONG Returned = 0;
+		const LONG Status = pNtQueryObject((::HANDLE)Handle, 2, Buffer, sizeof(Buffer), &Returned);
+		if (Status >= 0) {
+			// OBJECT_TYPE_INFORMATION opens with a UNICODE_STRING; spell out the layout
+			// rather than depending on which windows header happens to be in scope here.
+			struct TypeNameString { USHORT Length; USHORT MaximumLength; const wchar_t *Buffer; };
+			const auto *Name = reinterpret_cast<const TypeNameString *>(Buffer);
+			if (Name->Buffer != nullptr && Name->Length > 0) {
+				size_t Chars = Name->Length / sizeof(wchar_t);
+				if (Chars > sizeof(TypeName) - 1) {
+					Chars = sizeof(TypeName) - 1;
+				}
+				for (size_t i = 0; i < Chars; ++i) {
+					TypeName[i] = (char)Name->Buffer[i];
+				}
+				TypeName[Chars] = '\0';
+			}
+		}
+		else {
+			std::snprintf(TypeName, sizeof(TypeName), "<NtQueryObject 0x%08X>", (unsigned)Status);
+		}
+	}
+
+	if (std::strcmp(TypeName, "Event") == 0 && NtDll::NtQueryEvent != nullptr) {
+		struct { LONG Type; LONG Signalled; } Basic = { -1, -1 };
+		ULONG Returned = 0;
+		if (NtDll::NtQueryEvent((::HANDLE)Handle, NtDll::EventBasicInformation,
+			&Basic, sizeof(Basic), &Returned) >= 0) {
+			std::snprintf(State, sizeof(State), " [%s, signalled=%d]",
+				Basic.Type == 0 ? "NotificationEvent" : "SynchronizationEvent", (int)Basic.Signalled);
+		}
+	}
+	else if (std::strcmp(TypeName, "Thread") == 0) {
+		DWORD ExitCode = 0;
+		if (::GetExitCodeThread((::HANDLE)Handle, &ExitCode)) {
+			std::snprintf(State, sizeof(State), " [%s]",
+				ExitCode == STILL_ACTIVE ? "still running" : "exited");
+		}
+	}
+
+	std::snprintf(Description, sizeof(Description),
+		"%s%s from %s | signalled %u time(s), last by %s",
+		TypeName, State, Origin.c_str(), Signals,
+		LastSignaller.empty() ? "nobody" : LastSignaller.c_str());
+	return Description;
+}
+
+// ******************************************************************
+// * File read trail (Cxbx-R fork diagnostic)
+// ******************************************************************
+// The guest is FPO-compiled, so walking its stack only ever reaches XAPI wrappers -
+// the game's own functions keep no frame pointer and are invisible to an EBP chain.
+// What the loader was READING when it stopped names the subsystem just as well and
+// cannot be fooled by calling convention: the last file touched before an infinite
+// wait is the thing the wait is about.
+
+static std::mutex g_ReadTrailMtx;
+static std::map<void *, std::string> g_OpenFilePath;   // file handle -> path
+struct ReadTrailEntry { unsigned Thread; const char *Op; std::string Path; unsigned long long Offset; unsigned Length; };
+static ReadTrailEntry g_ReadTrail[256];
+static unsigned g_ReadTrailNext = 0;
+
+void CxbxrNoteFileOpened(void *FileHandle, const char *Path)
+{
+	if (FileHandle == nullptr || Path == nullptr) {
+		return;
+	}
+	std::lock_guard<std::mutex> lock(g_ReadTrailMtx);
+	g_OpenFilePath[FileHandle] = Path;
+}
+
+void CxbxrNoteFileOp(const char *Op, void *FileHandle, unsigned long long Offset, unsigned Length)
+{
+	std::lock_guard<std::mutex> lock(g_ReadTrailMtx);
+	const auto it = g_OpenFilePath.find(FileHandle);
+	ReadTrailEntry &Entry = g_ReadTrail[g_ReadTrailNext % (sizeof(g_ReadTrail) / sizeof(g_ReadTrail[0]))];
+	Entry.Thread = (unsigned)::GetCurrentThreadId();
+	Entry.Op = Op;
+	Entry.Path = (it != g_OpenFilePath.end()) ? it->second : "<unknown handle>";
+	Entry.Offset = Offset;
+	Entry.Length = Length;
+	g_ReadTrailNext++;
+
+	// The wedge always lands immediately after the first npc bundle, so log that
+	// phase in full rather than only the tail: comparing a level that loads against
+	// one that does not needs the whole sequence, not the last few entries. Nothing
+	// else is logged, which keeps this to a few dozen lines per level.
+	// Gizzard Gulch (region_02) is larger than Mongo Valley on every axis and loads
+	// fine, so this is not about scale - it is something specific in region_03's
+	// content. Logging the .lvl reads by offset says how far the parse got before it
+	// stopped, which points at the exact record to compare against a level that works.
+	if (Entry.Path.find("npc_") != std::string::npos
+	 || Entry.Path.find(".lvl") != std::string::npos
+	 || Entry.Path.find("character") != std::string::npos
+	 || Entry.Path.find("anim") != std::string::npos) {
+		printf("NPCIO: thread %u  %-24s %s  offset=%llu len=%u\n",
+			Entry.Thread, Op, Entry.Path.c_str(), Offset, Length);
+		fflush(stdout);
+	}
+}
+
+void CxbxrPrintReadTrail(void)
+{
+	std::lock_guard<std::mutex> lock(g_ReadTrailMtx);
+	const unsigned Slots = sizeof(g_ReadTrail) / sizeof(g_ReadTrail[0]);
+	const unsigned Count = (g_ReadTrailNext < Slots) ? g_ReadTrailNext : Slots;
+	printf("READTRAIL: the last %u file operations before the wedge, oldest first\n", Count);
+	for (unsigned i = 0; i < Count; ++i) {
+		const ReadTrailEntry &Entry = g_ReadTrail[(g_ReadTrailNext - Count + i) % Slots];
+		printf("READTRAIL:   thread %u  %-24s %s  offset=%llu len=%u\n",
+			Entry.Thread, Entry.Op ? Entry.Op : "?", Entry.Path.c_str(), Entry.Offset, Entry.Length);
+	}
+	fflush(stdout);
+}
+
+// How many times each path has been opened. Opened once is a load; opened hundreds
+// of times is a retry loop getting nowhere, which is what a stalled loader looks
+// like from outside.
+static std::mutex g_OpenCountMtx;
+static std::map<std::string, unsigned> g_OpenCounts;
+
+unsigned CxbxrNoteFileOpenAttempt(const char *Path)
+{
+	if (Path == nullptr) {
+		return 0;
+	}
+	std::lock_guard<std::mutex> lock(g_OpenCountMtx);
+	return ++g_OpenCounts[Path];
+}
+
+void CxbxrPrintOpenCounts(void)
+{
+	std::vector<std::pair<unsigned, std::string>> Sorted;
+	{
+		std::lock_guard<std::mutex> lock(g_OpenCountMtx);
+		for (const auto &Pair : g_OpenCounts) {
+			Sorted.emplace_back(Pair.second, Pair.first);
+		}
+	}
+	std::sort(Sorted.begin(), Sorted.end(),
+		[](const std::pair<unsigned, std::string> &a, const std::pair<unsigned, std::string> &b) {
+			return a.first > b.first;
+		});
+
+	printf("OPENCOUNTS: the 12 most-opened paths (a large count means a retry loop)\n");
+	for (size_t i = 0; i < Sorted.size() && i < 12; ++i) {
+		printf("OPENCOUNTS:   %8u  %s\n", Sorted[i].first, Sorted[i].second.c_str());
+	}
+	fflush(stdout);
+}
+
+// ******************************************************************
+// * Guest thread census (Cxbx-R fork diagnostic)
+// ******************************************************************
+// The blocked thread turned out to be the engine's async I/O worker, which is
+// SUPPOSED to sit in an infinite wait when there is nothing to do. That makes the
+// interesting thread the one that stopped queuing work - and to find it, every
+// guest thread has to be identifiable and its liveness known. Start addresses are
+// guest VAs the title's PDB resolves to real engine function names.
+
+struct GuestThreadRecord { unsigned StartAddress; unsigned Context; bool Exited; unsigned ExitStatus; };
+static std::mutex g_ThreadCensusMtx;
+static std::map<unsigned, GuestThreadRecord> g_ThreadCensus;
+
+void CxbxrNoteThreadStarted(unsigned ThreadId, unsigned StartAddress, unsigned Context)
+{
+	std::lock_guard<std::mutex> lock(g_ThreadCensusMtx);
+	g_ThreadCensus[ThreadId] = GuestThreadRecord{ StartAddress, Context, false, 0 };
+}
+
+void CxbxrNoteThreadExited(unsigned ThreadId, unsigned ExitStatus)
+{
+	std::lock_guard<std::mutex> lock(g_ThreadCensusMtx);
+	const auto it = g_ThreadCensus.find(ThreadId);
+	if (it != g_ThreadCensus.end()) {
+		it->second.Exited = true;
+		it->second.ExitStatus = ExitStatus;
+	}
+}
+
+void CxbxrPrintThreadCensus(void)
+{
+	std::lock_guard<std::mutex> lock(g_ThreadCensusMtx);
+	printf("THREADS: every guest thread created, and whether it is still running\n");
+	for (const auto &Pair : g_ThreadCensus) {
+		// A thread can be gone without having called PsTerminateSystemThread, so ask
+		// the OS rather than trusting the exit hook alone.
+		const char *Liveness = "unknown";
+		if (const HANDLE hThread = ::OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, Pair.first)) {
+			DWORD ExitCode = 0;
+			if (::GetExitCodeThread(hThread, &ExitCode)) {
+				Liveness = (ExitCode == STILL_ACTIVE) ? "RUNNING" : "DEAD";
+			}
+			::CloseHandle(hThread);
+		}
+		else {
+			Liveness = "DEAD (no handle)";
+		}
+		printf("THREADS:   tid=%-6u start=0x%08X context=0x%08X  %-16s %s\n",
+			Pair.first, Pair.second.StartAddress, Pair.second.Context, Liveness,
+			Pair.second.Exited ? "(exited cleanly)" : "");
+	}
+	fflush(stdout);
 }

@@ -30,7 +30,6 @@
 #include <condition_variable>
 #include <stack>
 
-
 #include <core\kernel\exports\xboxkrnl.h>
 #include "common\util\CxbxUtil.h"
 #include "CxbxVersion.h"
@@ -110,7 +109,13 @@ using namespace std::literals::chrono_literals;
 
 // Global(s)
 HWND                                g_hEmuWindow   = NULL; // rendering window
-bool                                g_bClipCursor  = false; // indicates that the mouse cursor should be confined inside the rendering window
+// Confine the mouse to the render window. Default ON: this title is played with
+// mouse-look, and an unconfined cursor walks straight out of a windowed game the
+// moment you turn far enough - the pointer hits the desktop, clicks land on other
+// applications, and turning stops working. Every windowed shooter captures the
+// cursor for this reason. F3 still toggles it, and WM_ACTIVATE releases it when the
+// window loses focus so Alt-Tab is never trapped.
+bool                                g_bClipCursor  = true; // indicates that the mouse cursor should be confined inside the rendering window
 IDirect3DDevice9Ex                 *g_pD3DDevice   = nullptr; // Direct3D Device
 
 // Static Variable(s)
@@ -195,16 +200,65 @@ static xbox::dword_xt                  *g_pXbox_BeginPush_Buffer = xbox::zeroptr
        xbox::X_PixelShader*			g_pXbox_PixelShader = xbox::zeroptr;
 
 // Render-progress counters - see Direct3D9.h
+// Bumped by anything that can change the host texture OBJECT, or its CONTENTS, for
+// an Xbox texture whose pointer and Data address stay the same. The per-stage memo
+// below keys on (pointer, Data) only, so it cannot see those events:
+//   * FreeHostResource destroys the host texture and CreateHostResource makes a NEW
+//     one - the memo says "unchanged" and D3D9 keeps the ORPHANED object bound,
+//     alive only on the reference SetTexture holds, with frozen contents.
+//   * ForceResourceRehash marks locked-and-rewritten pixels dirty, but the flag is
+//     only consumed via GetHostBaseTexture, which the memo's fast path skips.
+//   * A palette change alters the resource key for P8 textures.
+unsigned g_CxbxHostTextureGeneration = 1;
        unsigned                     g_RenderStat_Swaps = 0;
        unsigned                     g_RenderStat_HostDraws = 0;
        unsigned                     g_RenderStat_VertexShaderLookups = 0;
        unsigned                     g_RenderStat_VertexShaderMissing = 0;
        unsigned                     g_RenderStat_VertexShaderFromDevice = 0;
        unsigned                     g_RenderStat_NullTextureStages = 0;
+       unsigned                     g_RenderStat_TextureRebinds = 0;
+       unsigned                     g_RenderStat_TextureRebindsSkipped = 0;
+       unsigned                     g_RenderStat_TextureOverrides = 0;
+// The menu backdrop is a Bink movie (data\movies\main_screen.bik), not geometry.
+// On Xbox, Bink presents through the NV2A YUV overlay, so if the backdrop is black
+// while the UI draws fine, the question is whether frames arrive here at all.
+       unsigned                     g_RenderStat_EnableOverlay = 0;
+       unsigned                     g_RenderStat_UpdateOverlay = 0;
+       unsigned                     g_RenderStat_UpdateOverlayLTCG = 0;
+// CPU-written back buffer upload - see CxbxUploadXboxBackBufferToHost below.
+       bool                         g_bXboxBackBufferUploadPending = false;
+       unsigned                     g_RenderStat_BackBufferUploads = 0;
+       unsigned                     g_RenderStat_BackBufferUploadFails = 0;
+       unsigned                     g_RenderStat_BackBufferUploadWrongRT = 0;
+// Defined in XbVertexShader.cpp - declared here at file scope on purpose, since a
+// local extern inside D3DDevice_Swap would resolve into namespace xbox.
+extern unsigned g_VSStat_SetVertexShader, g_VSStat_SetVertexShader_ProgramBranch,
+                g_VSStat_LoadVertexShader, g_VSStat_SelectVertexShader,
+                g_VSStat_SelectVertexShader_WithHandle;
+extern unsigned g_VSStat_EffectiveMode[4], g_VSStat_ModeCorrected,
+                g_VSStat_StartAddressCorrected, g_VSStat_LastLiveStartAddress,
+                g_VSStat_LastShadowStartAddress;
+// Async file I/O accounting (EmuKrnlNt.cpp / EmuFile.cpp) - a level load that
+// wedges shows up here as reads issued that never complete.
+extern unsigned g_IoStat_Reads, g_IoStat_ReadsAsync, g_IoStat_ReadsPending,
+                g_IoStat_ReadsWithEvent, g_IoStat_ApcDelivered;
+// The last files the loader read before it stopped (EmuKrnl.cpp).
+void CxbxrPrintReadTrail(void);
+void CxbxrPrintOpenCounts(void);
+void CxbxrPrintThreadCensus(void);
+// Physical memory exhaustion (PhysicalMemory.cpp). A level that cannot allocate
+// stops loading without ever erroring, which is indistinguishable from a hang until
+// these are visible.
+extern unsigned g_MemStat_MapFailures, g_MemStat_LastRequestPages,
+                g_MemStat_RetailPagesFree, g_MemStat_DebugPagesFree;
+extern unsigned g_VertexStat_Overruns, g_VertexStat_OversizeVertexBuffers,
+                g_VertexStat_DroppedUnboundStream, g_VertexStat_LastUnboundStreamIndex,
+                g_VertexStat_VertexBufferAllocFailures; // XbVertexBuffer.cpp
+extern unsigned g_VSConst_Calls, g_VSConst_MinReg, g_VSConst_MaxReg; // XbVertexShader.cpp
+void CxbxGetVertexShaderConstantOccupancy(unsigned *pNonZero, unsigned *pHighest);
 #define RENDERSTATS_SWAP_INTERVAL 60
 static xbox::PVOID                   g_pXbox_Palette_Data[xbox::X_D3DTS_STAGECOUNT] = { xbox::zeroptr, xbox::zeroptr, xbox::zeroptr, xbox::zeroptr }; // cached palette pointer
 static unsigned                     g_Xbox_Palette_Size[xbox::X_D3DTS_STAGECOUNT] = { 0 }; // cached palette size
-
 
              D3DFORMAT               g_HostTextureFormats[xbox::X_D3DTS_STAGECOUNT]; // Updated by CxbxUpdateHostTextures(), read by CxbxCalcColorSign
        xbox::X_D3DBaseTexture       *g_pXbox_SetTexture[xbox::X_D3DTS_STAGECOUNT] = {0,0,0,0}; // Set by our D3DDevice_SetTexture and D3DDevice_SwitchTexture patches
@@ -214,7 +268,6 @@ xbox::X_D3DVIEWPORT8 g_Xbox_Viewport = { 0 };
 float g_Xbox_BackbufferScaleX = 1;
 float g_Xbox_BackbufferScaleY = 1;
 xbox::X_D3DSWAP g_LastD3DSwap = (xbox::X_D3DSWAP) -1;
-
 
 static constexpr size_t INDEX_BUFFER_CACHE_SIZE = 10000;
 
@@ -242,7 +295,6 @@ static void CxbxImGui_RenderD3D9(ImGuiUI* m_imgui, IDirect3DSurface9* renderTarg
 	}
 }
 
-
 /* Unused :
 static xbox::dword_xt                  *g_Xbox_D3DDevice; // TODO: This should be a D3DDevice structure
 */
@@ -256,7 +308,6 @@ static void							CxbxImpl_SetRenderTarget(xbox::X_D3DSurface *pRenderTarget, xb
 static void							CxbxrImpl_CatchUpXboxFence(); // Marks every Xbox GPU fence handed out so far as passed
 
 #define CXBX_D3DCOMMON_IDENTIFYING_MASK (X_D3DCOMMON_TYPE_MASK | X_D3DCOMMON_D3DCREATED)
-
 
 // Those should be used with LTCG patches which use __declspec(naked)
 #define LTCG_PROLOGUE \
@@ -273,7 +324,6 @@ static void							CxbxrImpl_CatchUpXboxFence(); // Marks every Xbox GPU fence ha
 		__asm pop  esi \
 		__asm mov  esp, ebp \
 		__asm pop  ebp
-
 
 typedef struct resource_key_hash {
 	// All Xbox X_D3DResource structs have these fields :
@@ -633,7 +683,6 @@ static void RunOnWndMsgThread(const std::function<void()>& func)
 	SendMessage(g_hEmuWindow, WM_CXBXR_RUN_ON_MESSAGE_THREAD, reinterpret_cast<WPARAM>(param), 0);
 }
 
-
 const char *D3DErrorString(HRESULT hResult)
 {
 	static char buffer[1024];
@@ -718,7 +767,6 @@ void DrawUEM(HWND hWnd)
 	HBITMAP hUEMBmp = CreateCompatibleBitmap(hDC, 640, 480);
 	HBITMAP hOriUEMBmp = (HBITMAP)SelectObject(hMemDC, hUEMBmp);
 
-
 	int nHeight = -MulDiv(8, GetDeviceCaps(hMemDC, LOGPIXELSY), 72);
 
 	HFONT hFont = CreateFont(nHeight, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, FF_ROMAN, "Verdana");
@@ -739,7 +787,6 @@ void DrawUEM(HWND hWnd)
 	DrawTextW(hMemDC, utf16str.c_str(), utf16str.length(), &textrect, DT_CALCRECT);
 	rect.top = (rect.bottom - textrect.bottom) / 2;
 	DrawTextW(hMemDC, utf16str.c_str(), utf16str.length(), &rect, DT_CENTER);
-
 
 	// Draw the Xbox error code
 
@@ -1030,6 +1077,7 @@ void FreeHostResource(resource_key_t key)
 	// Release the host resource and remove it from the list
 	auto& ResourceCache = GetResourceCache(key);
 	ResourceCache.erase(key);
+	g_CxbxHostTextureGeneration++; // host object gone - any stage still holding it is stale
 }
 
 void ClearResourceCache(resource_cache_t& ResourceCache)
@@ -1053,6 +1101,7 @@ void ForceResourceRehash(xbox::X_D3DResource* pXboxResource)
 	auto it = ResourceCache.find(key);
 	if (it != ResourceCache.end() && it->second.pHostResource) {
 		it->second.forceRehash = true;
+		g_CxbxHostTextureGeneration++; // contents changed - memo must re-run GetHostBaseTexture
 	}
 }
 
@@ -1216,6 +1265,26 @@ void SetHostResource(xbox::X_D3DResource* pXboxResource, IDirect3DResource* pHos
 
 	resourceInfo.HostFormat = PCFormat;
 	resourceInfo.HostUsage = D3DUsage;
+
+	// Resources the host GPU writes must never be re-created from a hash of Xbox
+	// memory: nothing on the host writes that memory back, so a hash change destroys
+	// the rendered contents and replaces them with a stale CPU upload. The resource is
+	// then rebuilt as a render target on the next SetRenderTarget, and the cycle
+	// repeats - alternating rendered content with a stale copy, which is flicker.
+	//
+	// Marking HERE rather than at each CreateHostResource exit is deliberate. Only 1
+	// of the 7 SetHostResource calls in CreateHostResource marks today, and the one it
+	// misses is the path this title actually uses, confirmed by disassembly:
+	//   CreateTexture2(Usage = RENDERTARGET) -> GetSurfaceLevel2 -> SetRenderTarget
+	// which returns as soon as GetSurfaceLevel succeeds and never reaches the
+	// standalone-surface marking further down. Every creation path funnels through
+	// this function, so marking here cannot miss one.
+	//
+	// D3DUSAGE_INVALID is -1 and has both bits set, so it must be excluded.
+	if (D3DUsage != D3DUSAGE_INVALID
+	 && (D3DUsage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)) != 0) {
+		resourceInfo.isRenderTarget = true;
+	}
 }
 
 IDirect3DSurface *GetHostSurface(xbox::X_D3DResource *pXboxResource, DWORD D3DUsage = 0)
@@ -1517,17 +1586,41 @@ static DWORD WINAPI EmuRenderWindow(LPVOID lpParam)
 
         g_hBgBrush = CreateBrushIndirect(&logBrush);
 
+        // Window icon. The class was registered with no icon at all (the TODO that
+        // used to be here), which is why the render window showed the blank default
+        // in the taskbar and alt-tab. Load "game.ico" from beside cxbxr-emu.dll if a
+        // package ships one - this keeps the branding in the package rather than
+        // compiled into the emulator, so it can be changed without a rebuild.
+        HICON hWindowIcon = nullptr;
+        {
+            char szIconPath[MAX_PATH] = {};
+            HMODULE hSelf = nullptr;
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                    (LPCSTR)&EmuMsgProc, &hSelf)
+             && GetModuleFileNameA(hSelf, szIconPath, MAX_PATH) > 0) {
+                char *pSlash = strrchr(szIconPath, '\\');
+                if (pSlash != nullptr) {
+                    strcpy_s(pSlash + 1, MAX_PATH - (size_t)(pSlash + 1 - szIconPath), "game.ico");
+                    // LR_DEFAULTSIZE picks the size Windows wants for a large icon;
+                    // the small one is loaded separately so alt-tab and the title bar
+                    // each get a properly-sized image instead of a scaled one.
+                    hWindowIcon = (HICON)LoadImageA(nullptr, szIconPath, IMAGE_ICON, 0, 0,
+                        LR_LOADFROMFILE | LR_DEFAULTSIZE);
+                }
+            }
+        }
+
         WNDCLASSEX wc =
         {
             sizeof(WNDCLASSEX),
             CS_CLASSDC,
             EmuMsgProc,
             0, 0, hActiveModule, // Was GetModuleHandle(nullptr),
-			0, // TODO : LoadIcon(hmodule, ?)
+			hWindowIcon,
             LoadCursor(NULL, IDC_ARROW),
             (HBRUSH)(g_hBgBrush), NULL,
             "CxbxRender",
-			nullptr
+			hWindowIcon
         };
 
         RegisterClassEx(&wc);
@@ -1549,12 +1642,54 @@ static DWORD WINAPI EmuRenderWindow(LPVOID lpParam)
 		// Then perform additional checks if not running in full screen.
 		if (!g_XBVideo.bFullScreen) {
 
-			// If running as kernel mode, force use the xbox's default resolution.
+			// If running as kernel mode, size the window to the render scale.
 			if (!CxbxKrnl_hEmuParent) {
-				// Xbox default resolution (standalone window is resizable by the way)
-				windowRect.right = 640;
-				windowRect.bottom = 480;
+				// This used to be a hard-coded 640x480 regardless of settings, so
+				// raising RenderResolution sharpened the image but left it displayed
+				// in a tiny window - the upscaled result was just downsampled straight
+				// back to 640x480. Scale the window to match so the extra pixels are
+				// actually visible.
 				dwStyle = WS_OVERLAPPEDWINDOW;
+
+				const int RenderScale = (g_XBVideo.renderScaleFactor > 0)
+					? (int)g_XBVideo.renderScaleFactor : 1;
+				int ClientWidth = 640 * RenderScale;
+				int ClientHeight = 480 * RenderScale;
+
+				// Don't open bigger than the usable desktop - at 4x this is 2560x1920,
+				// which is taller than a 1080p screen and would put the title bar and
+				// half the image off-screen. Shrink by whole steps first (keeping the
+				// 4:3 pixel grid exact), then fall back to a plain fit.
+				RECT WorkArea = { 0, 0, 640, 480 };
+				if (SystemParametersInfo(SPI_GETWORKAREA, 0, &WorkArea, 0)) {
+					const int MaxWidth = WorkArea.right - WorkArea.left;
+					const int MaxHeight = WorkArea.bottom - WorkArea.top;
+					int Fitted = RenderScale;
+					while (Fitted > 1 && (640 * Fitted > MaxWidth || 480 * Fitted > MaxHeight)) {
+						Fitted--;
+					}
+					ClientWidth = 640 * Fitted;
+					ClientHeight = 480 * Fitted;
+				}
+
+				// Grow the rect by the border and caption so the CLIENT area - the part
+				// the game actually draws into - ends up the size we asked for.
+				RECT Desired = { 0, 0, ClientWidth, ClientHeight };
+				AdjustWindowRect(&Desired, dwStyle, FALSE);
+
+				const int WindowWidth = Desired.right - Desired.left;
+				const int WindowHeight = Desired.bottom - Desired.top;
+
+				// Centre it on the work area rather than pinning it to the corner.
+				windowRect.left = WorkArea.left + ((WorkArea.right - WorkArea.left) - WindowWidth) / 2;
+				windowRect.top = WorkArea.top + ((WorkArea.bottom - WorkArea.top) - WindowHeight) / 2;
+				if (windowRect.left < WorkArea.left) windowRect.left = WorkArea.left;
+				if (windowRect.top < WorkArea.top) windowRect.top = WorkArea.top;
+				windowRect.right = windowRect.left + WindowWidth;
+				windowRect.bottom = windowRect.top + WindowHeight;
+
+				EmuLog(LOG_LEVEL::INFO, "Render window %dx%d client (scale %d)",
+					ClientWidth, ClientHeight, RenderScale);
 			}
 			else {
 				dwStyle = WS_CHILD;
@@ -1563,7 +1698,9 @@ static DWORD WINAPI EmuRenderWindow(LPVOID lpParam)
 
         g_hEmuWindow = CreateWindow
         (
-            "CxbxRender", "Cxbx-Reloaded",
+            // Window class stays "CxbxRender" - it is internal and other code looks
+            // it up. Only the visible caption is ours.
+            "CxbxRender", "Oddworld: Stranger's Wrath - 2004 Beta",
             dwStyle, 
 			windowRect.left,
 			windowRect.top,
@@ -1906,6 +2043,21 @@ static LRESULT WINAPI EmuMsgProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             if(CxbxKrnl_hEmuParent && !g_XBVideo.bFullScreen && !g_bIsFauxFullscreen)
             {
                 SetFocus(CxbxKrnl_hEmuParent);
+            }
+        }
+        break;
+
+        case WM_ACTIVATE:
+        {
+            // Hold the cursor only while this window is the active one. Without the
+            // release half, clipping would survive an Alt-Tab and pin the pointer to
+            // a window the user has already left - which looks like the machine has
+            // locked up. Re-clip on the way back in.
+            if (LOWORD(wParam) == WA_INACTIVE) {
+                CxbxReleaseCursor();
+            }
+            else if (g_bClipCursor) {
+                CxbxClipCursor(hWnd);
             }
         }
         break;
@@ -2300,7 +2452,6 @@ static void CreateDefaultD3D9Device
     });
 }
 
-
 // check if a resource has been registered yet (if not, register it)
 void CreateHostResource(xbox::X_D3DResource *pResource, DWORD D3DUsage, int iTextureStage, DWORD dwSize); // Forward declartion to prevent restructure of code
 static void EmuVerifyResourceIsRegistered(xbox::X_D3DResource *pResource, DWORD D3DUsage, int iTextureStage, DWORD dwSize)
@@ -2329,7 +2480,6 @@ static void EmuVerifyResourceIsRegistered(xbox::X_D3DResource *pResource, DWORD 
 			auto xboxSurface = (xbox::X_D3DSurface*)pResource;
 			auto xboxTexture = (xbox::X_D3DTexture*)pResource;
 			auto xboxResourceType = GetXboxD3DResourceType(pResource);
-
 
             // Only continue checking if we were able to get the surface desc, if it failed, we fall-through
             // to previous resource management behavior
@@ -3271,7 +3421,6 @@ __declspec(naked) xbox::void_xt WINAPI xbox::EMUPATCH(D3DDevice_SetIndices_4__LT
     }
 }
 
-
 // ******************************************************************
 // * patch: D3DDevice_SetIndices
 // ******************************************************************
@@ -3442,14 +3591,12 @@ __declspec(naked) xbox::hresult_xt WINAPI xbox::EMUPATCH(D3DDevice_Reset_0__LTCG
 	}
 }
 
-
 // ******************************************************************
 // * patch: D3DDevice_GetDisplayFieldStatus
 // ******************************************************************
 xbox::void_xt WINAPI xbox::EMUPATCH(D3DDevice_GetDisplayFieldStatus)(X_D3DFIELD_STATUS *pFieldStatus)
 {
 	// NOTE: This can be unpatched only when NV2A does it's own VBlank and HLE _Swap function is unpatched
-
 
 	LOG_FUNC_ONE_ARG(pFieldStatus);
 
@@ -3982,7 +4129,6 @@ xbox::void_xt WINAPI xbox::EMUPATCH(D3DDevice_GetGammaRamp)
 	free(pGammaRamp);
 }
 
-
 #define COPY_BACKBUFFER_TO_XBOX_SURFACE // Uncomment to enable writing Host Backbuffers back to Xbox surfaces
 xbox::X_D3DSurface* CxbxrImpl_GetBackBuffer2
 (
@@ -3990,7 +4136,6 @@ xbox::X_D3DSurface* CxbxrImpl_GetBackBuffer2
 )
 {
 	xbox::X_D3DSurface* pXboxBackBuffer = nullptr;
-
 
 #ifndef COPY_BACKBUFFER_TO_XBOX_SURFACE
 	/** unsafe, somehow
@@ -4011,7 +4156,6 @@ xbox::X_D3DSurface* CxbxrImpl_GetBackBuffer2
 
 		int iTextureStage = -1; // No iTextureStage!
 		SetHostResource(pXboxBackBuffer, (IDirect3DResource*)pCachedPrimarySurface, iTextureStage, 0, PCFormat);
-
 
 		hRet = g_pD3DDevice->GetFrontBuffer(pCachedPrimarySurface);
 		DEBUG_D3DRESULT(hRet, "g_pD3DDevice->GetFrontBuffer");
@@ -4101,7 +4245,6 @@ xbox::X_D3DSurface* CxbxrImpl_GetBackBuffer2
 	if (pXboxBackBuffer == nullptr) {
 		CxbxrAbort("D3DDevice_GetBackBuffer2: Could not get Xbox backbuffer");
 	}
-
 
     // HACK: Disabled: Enabling this breaks DOA3 at native res/without hacks+
     // Also likely to effect Other games, but it has no known benefit at this point in time
@@ -4361,7 +4504,6 @@ void CxbxUpdateHostViewPortOffsetAndScaleConstants()
     float vScaleOffset[2][4]; // 0 - scale 1 - offset
     GetXboxViewportOffsetAndScale(vScaleOffset[1], vScaleOffset[0]);
 
-
 	// Xbox outputs vertex positions in rendertarget pixel coordinate space, with non-normalized Z
 	// e.g. 0 < x < 640 and 0 < y < 480
 	// We want to scale it back to normalized device coordinates i.e. XY are (-1, +1) and Z is (0, 1)
@@ -4460,7 +4602,6 @@ void CxbxImpl_SetViewport(xbox::X_D3DVIEWPORT8* pViewport)
 	float rendertargetBaseWidth;
 	float rendertargetBaseHeight;
 	GetRenderTargetBaseDimensions(rendertargetBaseWidth, rendertargetBaseHeight);
-
 
 	// When new viewport is passed, use the render target dimensions instead
 	if (pViewport == nullptr) {
@@ -4924,7 +5065,6 @@ xbox::void_xt WINAPI xbox::EMUPATCH(D3DDevice_SetVertexData2s)
 	const float fa = static_cast<float>(a);
 	const float fb = static_cast<float>(b);
 
-
 	CxbxImpl_SetVertexData4f(Register, a, b, 0.0f, 1.0f);
 }
 
@@ -5233,7 +5373,6 @@ xbox::void_xt WINAPI xbox::EMUPATCH(D3DDevice_Clear)
 	DEBUG_D3DRESULT(hRet, "g_pD3DDevice->Clear");
 }
 
-
 // ******************************************************************
 // * patch: D3DDevice_CopyRects
 // ******************************************************************
@@ -5394,6 +5533,330 @@ __declspec(naked) xbox::dword_xt WINAPI xbox::EMUPATCH(D3DDevice_Swap_0__LTCG_ea
     }
 }
 
+#include <tlhelp32.h> // thread enumeration for the stall watchdog
+
+// ---------------------------------------------------------------------------
+// Stall watchdog.
+//
+// Loading some levels (Mongo Valley / region_03) ends in a black screen with the
+// process still ALIVE and no exception: it renders ~1300 frames, then Swap stops
+// being called and everything freezes. That is a deadlock or an infinite loop, and
+// a crash reporter never fires for it - there is no crash. Guessing where a hang
+// lives is exactly the trap that has cost this project repeatedly, so make the
+// emulator say it.
+//
+// When no Swap has happened for a few seconds, suspend the thread that was doing
+// the rendering, read its instruction pointer, and report it as module+offset -
+// the same form tools\pdb_resolve.ps1 turns into function + source line. Suspending
+// briefly to sample a hung thread is safe precisely because it is already stuck.
+static volatile DWORD  g_LastSwapTick = 0;
+static volatile DWORD  g_SwapThreadId = 0;
+static volatile LONG   g_StallReported = 0;
+
+static void CxbxrDescribeCodeAddress(void *pAddress, char *pBuffer, size_t BufferSize)
+{
+	HMODULE hModule = nullptr;
+	if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			(LPCSTR)pAddress, &hModule) && hModule != nullptr) {
+		char szPath[MAX_PATH] = { 0 };
+		if (GetModuleFileNameA(hModule, szPath, MAX_PATH) > 0) {
+			const char *pName = strrchr(szPath, 0x5C);
+			pName = (pName != nullptr) ? pName + 1 : szPath;
+			sprintf_s(pBuffer, BufferSize, "%s+0x%X", pName,
+				(unsigned)((uintptr_t)pAddress - (uintptr_t)hModule));
+			return;
+		}
+	}
+	// No module: this is guest (Xbox title) code, which is the interesting case -
+	// it means the hang is in the game itself. Print the address: "GUEST CODE" alone
+	// is unactionable, whereas the VA goes straight through the title's PDB
+	// (guest VA = PDB RVA + 0x10920) and comes back as an engine function name.
+	sprintf_s(pBuffer, BufferSize, "GUEST 0x%08X", (unsigned)(uintptr_t)pAddress);
+}
+
+
+// A stack value is only a return address if the instruction immediately before it is
+// a CALL. Checking that is the difference between a stack walk and a guess.
+//
+// The EBP walk this replaces produced a chain that disassembly then contradicted:
+// two of its frames were exact return addresses (verified against the call sites in
+// CoreObjectUtil::WritePointer and SetID), and three were values that could not
+// possibly follow from them. Guest code here is partly FPO-compiled, so an EBP chain
+// silently skips frames and then resumes on whatever it lands on. Scanning the stack
+// and keeping only slots preceded by a real CALL cannot invent a caller: a false
+// positive has to be a stale return address, which at least genuinely was one.
+static bool CxbxrIsGuestCallSite(uint32_t ReturnAddress, uint32_t CodeLo, uint32_t CodeHi)
+{
+	if (ReturnAddress <= CodeLo + 8 || ReturnAddress >= CodeHi) {
+		return false;
+	}
+	const uint8_t *p = (const uint8_t *)(uintptr_t)ReturnAddress;
+	if (IsBadReadPtr(p - 8, 8)) {
+		return false;
+	}
+	// E8 rel32 - direct call. Also require the target to land in code.
+	if (p[-5] == 0xE8) {
+		int32_t Rel;
+		memcpy(&Rel, p - 4, sizeof(Rel));
+		const uint32_t Target = ReturnAddress + (uint32_t)Rel;
+		if (Target > CodeLo && Target < CodeHi) {
+			return true;
+		}
+	}
+	if (p[-6] == 0xFF && (p[-5] & 0x38) == 0x10) return true; // call [disp32] / [reg+disp32]
+	if (p[-3] == 0xFF && (p[-2] & 0xF8) == 0x50) return true; // call [reg+disp8]
+	if (p[-2] == 0xFF && (p[-1] & 0xF8) == 0xD0) return true; // call reg
+	return false;
+}
+
+
+// The title's small-object allocator is a FIXED 4 MB arena carved into 1024 pages of
+// 4 KB (SmallAllocator_FixedRestoring.cpp). It never grows: a page returns to the
+// free list only when every object in it has been freed, so once all 1024 pages hold
+// at least one live object the next allocation asserts
+//   "Good Lord! Out of Pages in SmallAllocator_FixedRestoring!"
+// and the engine halts. That assert IS the Mongo Valley black screen. These globals
+// are read straight out of guest memory so the headroom can be watched over a load
+// instead of inferred after the fact.
+static void CxbxrReportSmallAllocator(void)
+{
+	const uint32_t kPoolBase = 0x002BDAAC; // set once by the initialiser
+	const uint32_t kPoolEnd  = 0x002BDAB0;
+	const uint32_t kFreeHead = 0x002BDAA8;
+	const uint32_t kPageNext = 0x0FF0;     // free pages are chained through page+0xFF0
+
+	if (IsBadReadPtr((const void *)(uintptr_t)kPoolBase, 4)) {
+		return;
+	}
+	const uint32_t Base = *(const uint32_t *)(uintptr_t)kPoolBase;
+	const uint32_t End  = *(const uint32_t *)(uintptr_t)kPoolEnd;
+	if (Base == 0) {
+		return; // allocator not initialised yet
+	}
+
+	// Walk the free list. The bound is the arena's own page count, not a constant:
+	// the first version stopped at 1024 - correct for the stock arena, but once it
+	// was enlarged to 4096 pages the walk hit its cap and reported "1025 free, 3071
+	// in use" whatever the truth was. That fictitious 3071 then went into a report as
+	// Mongo Valley's measured high-water mark. A bound taken from the thing being
+	// measured cannot lie that way.
+	const uint32_t Total = (End > Base) ? (End - Base) / 0x1000 : 0;
+	uint32_t Free = 0;
+	uint32_t Page = *(const uint32_t *)(uintptr_t)kFreeHead;
+	while (Page >= Base && Page < End && Free <= Total) {
+		++Free;
+		if (IsBadReadPtr((const void *)(uintptr_t)(Page + kPageNext), 4)) break;
+		Page = *(const uint32_t *)(uintptr_t)(Page + kPageNext);
+	}
+	printf("SMALLALLOC: pool 0x%08X-0x%08X  %u of %u pages free (%u in use)\n",
+		Base, End, Free, Total, (Total > Free) ? Total - Free : 0);
+	fflush(stdout);
+}
+
+static DWORD WINAPI CxbxrStallWatchdog(LPVOID)
+{
+	for (;;) {
+		Sleep(1000);
+
+		const DWORD LastTick = g_LastSwapTick;
+		const DWORD ThreadId = g_SwapThreadId;
+		if (LastTick == 0 || ThreadId == 0) {
+			continue; // rendering has not started yet
+		}
+
+		const DWORD Elapsed = GetTickCount() - LastTick;
+
+		// Two different freezes matter, and only one of them stops Swap.
+		//
+		// (a) Render wedge: Swap itself stops.
+		// (b) LOADER wedge: Swap keeps running - the render loop draws the loading
+		//     screen at ~1 draw per frame - while the thread doing the level load
+		//     stops issuing file reads and never resumes. Mongo Valley does exactly
+		//     this. Watching Swap alone can never see it, which is why the first
+		//     version of this watchdog stayed silent through the bug it was written
+		//     to catch.
+		static unsigned s_LastReadCount = 0;
+		static DWORD    s_LastReadTick = 0;
+		const DWORD NowTick = GetTickCount();
+		if (g_IoStat_Reads != s_LastReadCount) {
+			s_LastReadCount = g_IoStat_Reads;
+			s_LastReadTick = NowTick;
+		}
+		const bool bRenderWedged = (Elapsed >= 5000);
+		const bool bLoaderWedged = (s_LastReadTick != 0)
+			&& ((NowTick - s_LastReadTick) >= 3000)
+			&& !bRenderWedged;   // rendering still alive => it is the loader
+
+		if (!bRenderWedged && !bLoaderWedged) {
+			InterlockedExchange(&g_StallReported, 0); // healthy again
+			continue;
+		}
+		if (InterlockedExchange(&g_StallReported, 1) != 0) {
+			continue; // already reported this stall
+		}
+
+		if (bLoaderWedged) {
+			printf("STALL: LOADER wedged - no file read for %u ms while rendering continues"
+				" (swaps=%u reads=%u)\n",
+				(unsigned)(NowTick - s_LastReadTick), g_RenderStat_Swaps, g_IoStat_Reads);
+			// Where the load got to. Guest code is FPO-compiled, so its stack cannot name
+			// the subsystem - the files it was reading can.
+			printf("STALL: memory at the wedge: mapFailures=%u lastRequest=%u pages"
+				" | free retail=%u pages (%u MiB) debug=%u pages (%u MiB)\n",
+				g_MemStat_MapFailures, g_MemStat_LastRequestPages,
+				g_MemStat_RetailPagesFree, g_MemStat_RetailPagesFree / 256,
+				g_MemStat_DebugPagesFree, g_MemStat_DebugPagesFree / 256);
+			CxbxrPrintReadTrail();
+			CxbxrPrintOpenCounts();
+			CxbxrPrintThreadCensus();
+			CxbxrReportSmallAllocator();
+			// Sample EVERY thread INCLUDING the renderer. The first version skipped it
+			// on the assumption that a rendering thread cannot be the stuck one - but
+			// the thread census showed the renderer IS the title's main thread, it is
+			// alive, and it is the one that stopped queuing I/O. Skipping it hid the
+			// only thread that mattered.
+			HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+			if (hSnap != INVALID_HANDLE_VALUE) {
+				THREADENTRY32 te; te.dwSize = sizeof(te);
+				const DWORD MyPid = GetCurrentProcessId();
+				if (Thread32First(hSnap, &te)) {
+					do {
+						if (te.th32OwnerProcessID != MyPid) continue;
+						if (te.th32ThreadID == GetCurrentThreadId()) continue; // the watchdog itself
+						HANDLE hT = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT,
+							FALSE, te.th32ThreadID);
+						if (hT == nullptr) continue;
+						if (SuspendThread(hT) != (DWORD)-1) {
+							CONTEXT Ctx; memset(&Ctx, 0, sizeof(Ctx));
+							Ctx.ContextFlags = CONTEXT_CONTROL; // includes Eip, Esp, Ebp
+							if (GetThreadContext(hT, &Ctx)) {
+								char szWhere[MAX_PATH + 64];
+								CxbxrDescribeCodeAddress((void *)(uintptr_t)Ctx.Eip, szWhere, sizeof(szWhere));
+								printf("STALL:   thread %5u  EIP=0x%08X  = %s\n",
+									(unsigned)te.th32ThreadID, (unsigned)Ctx.Eip, szWhere);
+
+								// EIP only names the ntdll syscall stub - identical on every
+								// blocked thread. What matters is WHO called it, which means a
+								// real CALL CHAIN.
+								//
+								// The previous version SCANNED raw stack words and treated any
+								// value that resolved inside a module as a caller. That picks up
+								// stale leftovers just as readily as return addresses, and the
+								// symbolizer proved it: the "callers" resolved to things like
+								// CastToSet+0x1 and _tls_end+0x21709, which are not call sites.
+								// Eight threads appearing to share one address were sharing
+								// garbage from a common startup path.
+								//
+								// Walk the EBP chain instead. Each frame is [saved EBP][return
+								// address], so this follows actual frames. The guest is 2004-era
+								// MSVC x86 which keeps frame pointers, and it stops the moment
+								// the chain stops looking like a stack (non-increasing, absurd
+								// stride, unreadable) rather than inventing depth.
+								uintptr_t Frame = (uintptr_t)Ctx.Ebp;
+								const uintptr_t StackLo = (uintptr_t)Ctx.Esp;
+								int Depth = 0;
+								for (; Depth < 24; Depth++) {
+									if (Frame < StackLo || (Frame & 3) != 0) break;
+									if (IsBadReadPtr((const void *)Frame, sizeof(uintptr_t) * 2)) break;
+									const uintptr_t NextFrame = ((const uintptr_t *)Frame)[0];
+									const uintptr_t RetAddr   = ((const uintptr_t *)Frame)[1];
+									if (RetAddr < 0x10000) break;
+
+									HMODULE hMod = nullptr;
+									if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+											| GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+											(LPCSTR)RetAddr, &hMod) && hMod != nullptr) {
+										char szMod[MAX_PATH] = { 0 };
+										if (GetModuleFileNameA(hMod, szMod, MAX_PATH) > 0) {
+											const char *pMod = strrchr(szMod, 0x5C);
+											pMod = pMod ? pMod + 1 : szMod;
+											const unsigned Offset = (unsigned)(RetAddr - (uintptr_t)hMod);
+											// cxbxr-ldr.exe reserves the whole address space so the
+											// guest can live at Xbox addresses; anything past its
+											// real image is GUEST code, and that is the useful case.
+											if (_stricmp(pMod, "cxbxr-ldr.exe") == 0 && Offset > 0x10000) {
+												printf("STALL:     #%-2d GUEST 0x%08X\n", Depth, (unsigned)RetAddr);
+											} else {
+												printf("STALL:     #%-2d %s+0x%X\n", Depth, pMod, Offset);
+											}
+										}
+									} else {
+										printf("STALL:     #%-2d GUEST 0x%08X (unmapped)\n", Depth, (unsigned)RetAddr);
+									}
+
+									// A valid chain grows upward in modest steps. Anything else
+									// means we have walked off the end - stop rather than print
+									// fiction.
+									if (NextFrame <= Frame || (NextFrame - Frame) > 0x40000) break;
+									Frame = NextFrame;
+								}
+
+								// Second opinion, and the one to trust: scan the stack and keep only slots
+								// whose preceding instruction is a real CALL. The EBP chain above is kept
+								// because it is cheap and sometimes right, but where the two disagree this
+								// one is the evidence - it was disassembly of these call sites that showed
+								// the EBP chain had invented three of its five guest frames.
+								{
+									const uint32_t CodeLo = XBE_IMAGE_BASE;
+									const uint32_t CodeHi = XBE_IMAGE_BASE + 0x400000;
+									uint32_t Scanned = 0, Printed = 0;
+									for (uintptr_t Slot = (uintptr_t)Ctx.Esp;
+									     Slot < (uintptr_t)Ctx.Esp + 0x4000 && Printed < 24; Slot += 4, ++Scanned) {
+										if (IsBadReadPtr((const void *)Slot, 4)) break;
+										const uint32_t Value = *(const uint32_t *)Slot;
+										if (!CxbxrIsGuestCallSite(Value, CodeLo, CodeHi)) continue;
+										printf("STALL:     call-site frame  GUEST 0x%08X\n", Value);
+										++Printed;
+									}
+								}
+								if (Depth == 0) {
+									printf("STALL:     (no frame chain - EBP=0x%08X, likely FPO or guest code without frame pointers)\n",
+										(unsigned)Ctx.Ebp);
+								}
+							}
+							ResumeThread(hT);
+						}
+						CloseHandle(hT);
+					} while (Thread32Next(hSnap, &te));
+				}
+				CloseHandle(hSnap);
+			}
+			fflush(stdout);
+			continue;
+		}
+
+		printf("STALL: no Swap for %u ms (swaps=%u) - sampling render thread %u\n",
+			(unsigned)Elapsed, g_RenderStat_Swaps, (unsigned)ThreadId);
+
+		HANDLE hThread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, ThreadId);
+		if (hThread == nullptr) {
+			printf("STALL:   could not open the render thread (err %u)\n", (unsigned)GetLastError());
+			fflush(stdout);
+			continue;
+		}
+
+		// Sample it a few times: a spin loop moves, a blocked wait does not.
+		for (int Sample = 0; Sample < 3; Sample++) {
+			if (SuspendThread(hThread) == (DWORD)-1) { break; }
+
+			CONTEXT Context;
+			memset(&Context, 0, sizeof(Context));
+			Context.ContextFlags = CONTEXT_CONTROL;
+			if (GetThreadContext(hThread, &Context)) {
+				char szWhere[MAX_PATH + 64];
+				CxbxrDescribeCodeAddress((void *)(uintptr_t)Context.Eip, szWhere, sizeof(szWhere));
+				printf("STALL:   sample %d  EIP=0x%08X  ESP=0x%08X  = %s\n",
+					Sample, (unsigned)Context.Eip, (unsigned)Context.Esp, szWhere);
+			}
+			ResumeThread(hThread);
+			Sleep(150);
+		}
+		CloseHandle(hThread);
+		fflush(stdout);
+	}
+	return 0;
+}
+
 // ******************************************************************
 // * patch: D3DDevice_Swap
 // ******************************************************************
@@ -5405,11 +5868,140 @@ xbox::dword_xt WINAPI xbox::EMUPATCH(D3DDevice_Swap)
 	LOG_FUNC_ONE_ARG(Flags);
 	PerfTrace_OnSwapBegin(); // prints previous frame, resets accumulators, starts swap timer
 
+	// Arm the CPU-written back buffer upload for the frame that is about to begin;
+	// it runs from the first pre-draw update so the movie ends up under the UI.
+	g_bXboxBackBufferUploadPending = true;
+
+	// Feed the stall watchdog: record that rendering is alive and which thread is
+	// doing it, so a freeze can be sampled where it happens.
+	g_LastSwapTick = GetTickCount();
+	g_SwapThreadId = GetCurrentThreadId();
+	{
+		static bool s_WatchdogStarted = false;
+		if (!s_WatchdogStarted) {
+			s_WatchdogStarted = true;
+			HANDLE h = CreateThread(nullptr, 0, CxbxrStallWatchdog, nullptr, 0, nullptr);
+			if (h != nullptr) { CloseHandle(h); }
+		}
+	}
+
 	if ((++g_RenderStat_Swaps % RENDERSTATS_SWAP_INTERVAL) == 0) {
-		printf("RENDERSTATS: swaps=%u hostDraws=%u vertexShaderLookups=%u fromDevice=%u missing=%u nullTexStages=%u\n",
+		printf("RENDERSTATS: swaps=%u hostDraws=%u vertexShaderLookups=%u fromDevice=%u missing=%u nullTexStages=%u texRebinds=%u skipped=%u overrides=%u\n",
 			g_RenderStat_Swaps, g_RenderStat_HostDraws,
 			g_RenderStat_VertexShaderLookups, g_RenderStat_VertexShaderFromDevice,
-			g_RenderStat_VertexShaderMissing, g_RenderStat_NullTextureStages);
+			g_RenderStat_VertexShaderMissing, g_RenderStat_NullTextureStages,
+			g_RenderStat_TextureRebinds, g_RenderStat_TextureRebindsSkipped, g_RenderStat_TextureOverrides);
+
+		// Draws ARE being submitted (~38/frame) yet the title's 3D scene is not
+		// visible, so the geometry is going somewhere off-screen rather than not
+		// being drawn at all. Report the state that decides WHERE it lands: the
+		// Xbox viewport, the depth range, and which vertex pipeline is active.
+		// A degenerate viewport (zero width/height) or an inverted depth range
+		// silently discards every triangle while D3D reports no error.
+		printf("RENDERSTATS: viewport x=%u y=%u w=%u h=%u minZ=%.3f maxZ=%.3f | mode=%s | upscale=%.2f\n",
+			g_Xbox_Viewport.X, g_Xbox_Viewport.Y,
+			g_Xbox_Viewport.Width, g_Xbox_Viewport.Height,
+			g_Xbox_Viewport.MinZ, g_Xbox_Viewport.MaxZ,
+			g_Xbox_VertexShaderMode == VertexShaderMode::FixedFunction ? "FixedFunction"
+				: (g_Xbox_VertexShaderMode == VertexShaderMode::ShaderProgram ? "ShaderProgram" : "other"),
+			(float)g_RenderUpscaleFactor);
+
+		// Which link of the chain breaks. SelectVertexShader sets ShaderProgram
+		// unconditionally, so selectVS=0 means our hook on it never fires at all -
+		// on an LTCG build that points at the entry being inlined into its callers
+		// rather than at the patch being wrong.
+		printf("RENDERSTATS: setVS=%u (programBranch=%u) loadVS=%u selectVS=%u (withHandle=%u)\n",
+			g_VSStat_SetVertexShader, g_VSStat_SetVertexShader_ProgramBranch,
+			g_VSStat_LoadVertexShader, g_VSStat_SelectVertexShader,
+			g_VSStat_SelectVertexShader_WithHandle);
+		{
+			CxbxrReportSmallAllocator();
+			printf("RENDERSTATS: io reads=%u async=%u withEvent=%u apcDelivered=%u\n",
+				g_IoStat_Reads, g_IoStat_ReadsAsync, g_IoStat_ReadsWithEvent, g_IoStat_ApcDelivered);
+		}
+		printf("RENDERSTATS: enableOverlay=%u updateOverlay=%u updateOverlayLTCG(dropped)=%u"
+			" vertexOverruns=%u oversizeVBs=%u droppedUnboundStream=%u (lastStream=%u)"
+			" vbAllocFailures=%u\n",
+			g_RenderStat_EnableOverlay, g_RenderStat_UpdateOverlay,
+			g_RenderStat_UpdateOverlayLTCG, g_VertexStat_Overruns,
+			g_VertexStat_OversizeVertexBuffers,
+			g_VertexStat_DroppedUnboundStream, g_VertexStat_LastUnboundStreamIndex,
+			g_VertexStat_VertexBufferAllocFailures);
+		// Is the menu backdrop actually being written into the Xbox back buffer?
+		//
+		// The title does not DRAW the movie. BackBufferPlayer::DisplayFrame (0x114601)
+		// calls GetBackBuffer2, locks it, memsets it to black, and then has Bink
+		// software-decode the frame straight into that memory as 32-bit BGRA
+		// (BinkCopyToBuffer with BINKCOPYALL|BINKSURFACE32). There is no draw call, no
+		// texture and no overlay - which is why 38 clean draws per frame and zero
+		// overlay calls never found it. D3DSurface_LockRect is not even patched, so
+		// Cxbx never sees the write.
+		//
+		// Count non-black pixels in the Xbox surface. Non-zero here means Bink is
+		// decoding correctly and the loss is purely that this guest memory never
+		// reaches the host render target.
+		if (g_pXbox_BackBufferSurface != xbox::zeroptr) {
+			uint8_t *pXboxData = (uint8_t *)GetDataFromXboxResource(g_pXbox_BackBufferSurface);
+			UINT bbW, bbH, bbD, bbPitch, bbSlice;
+			CxbxGetPixelContainerMeasures(g_pXbox_BackBufferSurface, 0, &bbW, &bbH, &bbD, &bbPitch, &bbSlice);
+			if (pXboxData != nullptr && bbW > 0 && bbH > 0
+			 && g_VMManager.IsValidVirtualAddress((VAddr)pXboxData)) {
+				// Sample every 16th pixel of every 4th row - enough to tell "black" from
+				// "an image" without walking 1.2 MB on the presenting thread.
+				unsigned sampled = 0, nonBlack = 0;
+				uint32_t orAll = 0;
+				for (UINT y = 0; y < bbH; y += 4) {
+					const uint32_t *row = (const uint32_t *)(pXboxData + (size_t)y * bbPitch);
+					for (UINT x = 0; x < bbW; x += 16) {
+						uint32_t px = row[x] & 0x00FFFFFF; // ignore alpha
+						orAll |= px;
+						sampled++;
+						if (px != 0) nonBlack++;
+					}
+				}
+				printf("RENDERSTATS: xboxBackBuffer %ux%u pitch=%u sampled=%u nonBlack=%u or=0x%06X"
+					" | uploads=%u fails=%u\n",
+					bbW, bbH, bbPitch, sampled, nonBlack, orAll,
+					g_RenderStat_BackBufferUploads, g_RenderStat_BackBufferUploadFails);
+			}
+			else {
+				printf("RENDERSTATS: xboxBackBuffer data unavailable (ptr=%p %ux%u)\n",
+					pXboxData, bbW, bbH);
+			}
+		}
+		else {
+			printf("RENDERSTATS: xboxBackBuffer surface not tracked yet\n");
+		}
+
+		{
+			unsigned ConstNonZero = 0, ConstHighest = 0;
+			CxbxGetVertexShaderConstantOccupancy(&ConstNonZero, &ConstHighest);
+			printf("RENDERSTATS: vsConstCalls=%u regs[%u..%u] nonZero=%u highestNonZero=%u\n",
+				g_VSConst_Calls,
+				(g_VSConst_MinReg == 0xFFFFFFFFu) ? 0 : g_VSConst_MinReg,
+				g_VSConst_MaxReg, ConstNonZero, ConstHighest);
+
+			// The bone palette arrives ONLY through the push buffer on this title.
+			// pushConstRegs == 0 while skinned characters are on screen means the
+			// drain is not seeing the title's hand-written NV2A methods; a healthy
+			// run shows maxReg around 164 (55 bones x 3 registers, minus one).
+			// constMode bit 0x10 is X_D3DSCM_NORESERVEDCONSTANTS. This engine packs
+			// bones from Xbox register -96 upward, so host constants 58/59 sit inside
+			// the palette; if the title has NOT freed the reserved pair, Cxbx's
+			// viewport scale/offset write clobbers one bone every frame.
+			printf("RENDERSTATS: pushConstDrains=%u regs=%u resyncs=%u lastLoad=%u maxReg=%u constMode=0x%X\n",
+				g_PushConst_Drains, g_PushConst_Registers, g_PushConst_Resyncs,
+				g_PushConst_LastLoad, g_PushConst_MaxReg,
+				(unsigned)g_Xbox_VertexShaderConstantMode);
+		}
+
+		printf("RENDERSTATS: effective FF=%u PT=%u PROG=%u | modeCorrected=%u"
+			" startAddrCorrected=%u live=0x%X shadow=0x%X\n",
+			g_VSStat_EffectiveMode[(unsigned)VertexShaderMode::FixedFunction & 3],
+			g_VSStat_EffectiveMode[(unsigned)VertexShaderMode::Passthrough & 3],
+			g_VSStat_EffectiveMode[(unsigned)VertexShaderMode::ShaderProgram & 3],
+			g_VSStat_ModeCorrected, g_VSStat_StartAddressCorrected,
+			g_VSStat_LastLiveStartAddress, g_VSStat_LastShadowStartAddress);
 	}
 
 	// Everything submitted for this frame has already been drawn synchronously on
@@ -6497,7 +7089,6 @@ void CreateHostResource(xbox::X_D3DResource *pResource, DWORD D3DUsage, int iTex
 			dwCubeFaceOffset += actualSlicePitch;
 		} // for cube faces
 
-
         // Copy from the intermediate resource to the final host resource
         // This is necessary because CopyRects/StretchRects only works on resources in the DEFAULT pool
         // But resources in this pool are not lockable: We must use UpdateSurface/UpdateTexture instead!
@@ -6911,6 +7502,7 @@ xbox::void_xt WINAPI xbox::EMUPATCH(D3DDevice_EnableOverlay)
 {
 	LOG_FUNC_ONE_ARG(Enable);
 
+	g_RenderStat_EnableOverlay++;
 	CxbxrImpl_EnableOverlay();
 }
 
@@ -6978,6 +7570,7 @@ xbox::void_xt WINAPI xbox::EMUPATCH(D3DDevice_UpdateOverlay)
 		LOG_FUNC_ARG(ColorKey)
 		LOG_FUNC_END;
 
+	g_RenderStat_UpdateOverlay++;
 	CxbxrImpl_UpdateOverlay(pSurface, SrcRect, DstRect, EnableColorKey, ColorKey);
 }
 
@@ -7000,6 +7593,13 @@ static void D3DDevice_UpdateOverlay_16__LTCG_eax2
 		LOG_FUNC_ARG(EnableColorKey)
 		LOG_FUNC_ARG(ColorKey)
 		LOG_FUNC_END;
+
+	// NOTE: this LTCG variant has no body - it accepts the call and drops the
+	// frame. Both it and the plain variant are registered in Patches.cpp, which is
+	// the double-patch pattern that already cost us SetTransform, LoadVertexShader,
+	// SelectVertexShader and D3D_DestroyResource on this title. Count it, so a
+	// silently-swallowed overlay shows up as a number instead of a black screen.
+	g_RenderStat_UpdateOverlayLTCG++;
 }
 
 // This uses a custom calling convention where parameter is passed in EAX
@@ -7275,7 +7875,6 @@ xbox::void_xt WINAPI xbox::EMUPATCH(Lock2DSurface)
 		LOG_FUNC_ARG(Flags)
 		LOG_FUNC_END;
 
-
 	// Pass through to the Xbox implementation of this function
 	XB_TRMP(Lock2DSurface)(pPixelContainer, FaceType, Level, pLockedRect, pRect, Flags);
 
@@ -7413,7 +8012,6 @@ __declspec(naked) xbox::void_xt WINAPI xbox::EMUPATCH(Lock3DSurface_16__LTCG_eax
 
 	// Log
 	Lock3DSurface_16__LTCG_eax4(pPixelContainer, Level, pLockedVolume, pBox, Flags);
-
 
 	// Pass through to the Xbox implementation of this function
 	__asm {
@@ -8057,6 +8655,28 @@ static IDirect3DBaseTexture *CxbxrGetDummyTexture()
 	return g_pCxbxDummyTexture;
 }
 
+// Host texture stages written by code OTHER than CxbxUpdateHostTextures.
+//
+// CxbxUpdateHostTextures memoises per stage and skips SetTexture when the Xbox
+// texture is unchanged. That is only safe while it is the ONLY writer of host
+// stages - and it is not. XboxTextureStateConverter::Apply() implements point
+// sprites by copying stage 3's texture onto host stage 0, and never restores it.
+// Upstream got away with that because textures were re-set unconditionally on every
+// draw, which repaired stage 0 before it mattered. With the memo, the next draw that
+// still has the same Xbox texture on stage 0 takes the early-out and renders with
+// the PARTICLE texture instead - the wrong texture for a frame, snapping back as
+// soon as the title binds something different. Marking the stage dirty restores the
+// repair without giving up the memo everywhere else.
+static unsigned g_CxbxHostTextureStageDirty = 0;
+
+
+void CxbxInvalidateHostTextureStage(int stage)
+{
+	if (stage >= 0 && stage < xbox::X_D3DTS_STAGECOUNT) {
+		g_CxbxHostTextureStageDirty |= (1u << stage);
+	}
+}
+
 void CxbxUpdateHostTextures()
 {
 	PERF_SCOPE(PERF_CAT_UPDATE_TEXTURES);
@@ -8068,17 +8688,46 @@ void CxbxUpdateHostTextures()
 	static IDirect3DBaseTexture* s_lastHostTexture[xbox::X_D3DTS_STAGECOUNT] = {};
 	static xbox::X_D3DBaseTexture* s_lastXboxTexture[xbox::X_D3DTS_STAGECOUNT] = {};
 	static xbox::addr_xt s_lastXboxTextureData[xbox::X_D3DTS_STAGECOUNT] = {};
+	static unsigned s_lastGeneration[xbox::X_D3DTS_STAGECOUNT] = {};
+	static bool s_lastPixelShaderBound[xbox::X_D3DTS_STAGECOUNT] = {};
+
+	// The dummy-white substitution further down is conditional on a pixel shader
+	// being bound, and that was never part of the memo key. Without it the decision
+	// is made once at a transition and reused across draws that flip in and out of
+	// the fixed-function pipeline - leaving a 1x1 white texture where fixed function
+	// expects none, or nothing where a pixel shader samples an unbound stage.
+	const bool bPixelShaderBound = (g_pXbox_PixelShader != xbox::zeroptr);
 
 	// Set the host texture for each stage
 	for (int stage = 0; stage < xbox::X_D3DTS_STAGECOUNT; stage++) {
 		auto pXboxBaseTexture = g_pXbox_SetTexture[stage];
 
-		// Fast path: if the Xbox texture pointer AND data address haven't changed, skip all work.
-		// We check Data too because SwitchTexture reuses the same pointer with different Data.
+		// NOTE: there is deliberately NO early-out on the Xbox texture pointer here.
+		//
+		// An earlier version skipped this whole body when (pointer, Data) were
+		// unchanged. That is wrong, and it is what made world textures render dark,
+		// black or flickering. On Xbox a texture is just RAM: the title can rewrite
+		// its pixels with no API call at all. Cxbx detects that inside
+		// GetHostBaseTexture -> EmuVerifyResourceIsRegistered ->
+		// HostResourceRequiresUpdate, which hashes the guest data and re-uploads when
+		// it changed. Skipping GetHostBaseTexture skipped the ONLY content check, so
+		// a texture the title updated in place kept whatever the host first uploaded -
+		// stale content, or black when the host copy was made before the guest filled
+		// it. It snapped back the moment the title bound something else, which is what
+		// made it look like flicker.
+		//
+		// A generation counter was added to cover this, but it can only see changes
+		// that come through an API (Lock, palette, resource free) - never a direct
+		// write, which is the common case.
+		//
+		// The hash is throttled internally (nextHashTime), so calling this per draw
+		// costs a map lookup and a timestamp compare in the steady state. The memo is
+		// kept, but keyed on the RESOLVED HOST texture: redundant SetTexture calls -
+		// the thing actually worth avoiding - are still skipped, while every draw
+		// still gets its content check.
 		xbox::addr_xt xboxData = (pXboxBaseTexture != xbox::zeroptr) ? pXboxBaseTexture->Data : 0;
-		if (pXboxBaseTexture == s_lastXboxTexture[stage] && xboxData == s_lastXboxTextureData[stage]) {
-			continue;
-		}
+		const bool bStageDirty = (g_CxbxHostTextureStageDirty & (1u << stage)) != 0;
+		g_CxbxHostTextureStageDirty &= ~(1u << stage);
 
 		IDirect3DBaseTexture* pHostBaseTexture = nullptr;
 		bool bNeedRelease = false;
@@ -8129,13 +8778,32 @@ void CxbxUpdateHostTextures()
 			}
 		}
 
-		HRESULT hRet = g_pD3DDevice->SetTexture(stage, pHostBaseTexture);
-		DEBUG_D3DRESULT(hRet, "g_pD3DDevice->SetTexture");
+		// Now that the content check above has run (and re-created the host texture if
+		// the guest data changed), the resolved pointer is authoritative: if it is the
+		// same object already bound to this stage, the SetTexture call is genuinely
+		// redundant and can be skipped. bStageDirty forces it anyway, for stages that
+		// something else wrote behind our back (see the point-sprite note above).
+		const bool bAlreadyBound = !bStageDirty
+			&& pHostBaseTexture == s_lastHostTexture[stage]
+			&& s_lastPixelShaderBound[stage] == bPixelShaderBound;
+		if (!bAlreadyBound) {
+			HRESULT hRet = g_pD3DDevice->SetTexture(stage, pHostBaseTexture);
+			DEBUG_D3DRESULT(hRet, "g_pD3DDevice->SetTexture");
+			g_RenderStat_TextureRebinds++;
+		}
+		else {
+			g_RenderStat_TextureRebindsSkipped++;
+		}
+
 		s_lastHostTexture[stage] = pHostBaseTexture;
 		s_lastXboxTexture[stage] = pXboxBaseTexture;
 		s_lastXboxTextureData[stage] = xboxData;
+		s_lastGeneration[stage] = g_CxbxHostTextureGeneration;
+		s_lastPixelShaderBound[stage] = bPixelShaderBound;
 
 		if (bNeedRelease) {
+			// Released whether or not SetTexture ran: when it did, D3D9 holds its own
+			// reference; when it did not, this temporary is simply unused.
 			pHostBaseTexture->Release();
 		}
 	}
@@ -8415,12 +9083,164 @@ void CxbxUpdateHostViewport() {
 extern void CxbxUpdateHostVertexDeclaration(); // TMP glue
 extern void CxbxUpdateHostVertexShader(); // TMP glue
 
+// Pushes CPU-written Xbox back buffer content up to the host render target.
+//
+// The Xbox has unified memory: the surface a title locks through GetBackBuffer +
+// LockRect IS the memory the GPU scans out, so software rendering straight into it
+// just works. On PC the host render target is a separate GPU allocation, and Cxbx
+// never reads guest back buffer memory back - the copy in CxbxrImpl_GetBackBuffer2
+// is #if 0'd out with the comment "There are currently no known games that depend
+// on backbuffer readback on the CPU!".
+//
+// This title depends on exactly that. Its menu backdrop is a Bink movie
+// (data\movies\main_screen.bik, 640x480, 29.97fps, 277 frames, looped) and
+// BackBufferPlayer::DisplayFrame (0x114601) presents it with NO draw call at all:
+//     GetBackBuffer2 -> LockRect(X_D3DLOCK_TILED) -> memset black
+//       -> BinkCopyToBuffer(BINKCOPYALL|BINKSURFACE32)   // software YUV->BGRA
+// D3DSurface_LockRect is not patched, so nothing in Cxbx ever observes the write
+// and every decoded frame was discarded. Measured: the Xbox back buffer holds a
+// 640x480 image with ~97% non-black pixels whose count changes every frame.
+//
+// Uploading here - from the pre-draw update, rather than at Swap - is deliberate:
+// the movie must land UNDER the menu. The title writes the frame in GUI::Render and
+// then draws the SWF front end over it, so pushing at the first draw of a frame
+// reproduces the Xbox's layering. Doing it at Swap would paint the movie over the UI.
+static IDirect3DSurface9 *g_pXboxBackBufferUpload = nullptr;
+static UINT               g_XboxBackBufferUploadW = 0, g_XboxBackBufferUploadH = 0;
+
+static void CxbxUploadXboxBackBufferToHost()
+{
+	if (g_pXbox_BackBufferSurface == xbox::zeroptr || g_pD3DDevice == nullptr) {
+		return;
+	}
+
+	uint8_t *pXboxData = (uint8_t *)GetDataFromXboxResource(g_pXbox_BackBufferSurface);
+	if (pXboxData == nullptr || !g_VMManager.IsValidVirtualAddress((VAddr)pXboxData)) {
+		return;
+	}
+
+	UINT Width, Height, Depth, RowPitch, SlicePitch;
+	CxbxGetPixelContainerMeasures(g_pXbox_BackBufferSurface, 0, &Width, &Height, &Depth, &RowPitch, &SlicePitch);
+	if (Width == 0 || Height == 0 || RowPitch < Width * 4) {
+		return; // Not the 32-bit linear layout Bink writes
+	}
+
+	// Never blit onto anything but the back buffer.
+	//
+	// This runs from the pre-draw update, which is reached from the frame's first
+	// Clear or its first draw - whichever comes first - and neither is guaranteed to
+	// have the back buffer bound. This engine renders shadow maps into off-screen
+	// targets; StretchRect onto one of those is legal D3D9 and would succeed SILENTLY,
+	// poisoning every surface that target feeds. Measured: this path performs zero
+	// blits during gameplay, so the hazard is currently dormant rather than active -
+	// which is exactly when it is cheap to close.
+	if (g_pXbox_RenderTarget != xbox::zeroptr
+	 && g_pXbox_RenderTarget != g_pXbox_BackBufferSurface) {
+		g_RenderStat_BackBufferUploadWrongRT++;
+		return;
+	}
+
+	// Only push when the CPU is actually producing frames.
+	//
+	// Blitting unconditionally would be wrong during normal 3D rendering: the
+	// upload runs after the title's Clear but before its first draw, so a stale
+	// guest back buffer would overwrite the cleared target and show through
+	// wherever geometry does not cover. Guest memory is only interesting while
+	// something is writing into it, and a decoding movie changes it every frame.
+	//
+	// The grace period keeps a briefly-identical frame (a paused or duplicated
+	// movie frame) from dropping out for one frame and flickering.
+	static uint32_t s_LastChecksum = 0;
+	static unsigned s_FramesSinceChange = ~0u;
+	uint32_t Checksum = 2166136261u;
+	for (UINT y = 0; y < Height; y += 8) {
+		const uint32_t *row = (const uint32_t *)(pXboxData + (size_t)y * RowPitch);
+		for (UINT x = 0; x < Width; x += 32) {
+			Checksum = (Checksum ^ row[x]) * 16777619u;
+		}
+	}
+	if (Checksum != s_LastChecksum) {
+		s_LastChecksum = Checksum;
+		s_FramesSinceChange = 0;
+	}
+	else if (s_FramesSinceChange != ~0u) {
+		s_FramesSinceChange++;
+	}
+	if (s_FramesSinceChange > 60) {
+		return; // nothing has written here for two seconds - not a CPU-drawn frame
+	}
+
+	// (Re)create the staging surface when the back buffer size changes. An
+	// offscreen plain surface in the DEFAULT pool is used because it is both
+	// lockable and a legal StretchRect source onto a render target.
+	if (g_pXboxBackBufferUpload == nullptr
+	 || g_XboxBackBufferUploadW != Width || g_XboxBackBufferUploadH != Height) {
+		if (g_pXboxBackBufferUpload != nullptr) {
+			g_pXboxBackBufferUpload->Release();
+			g_pXboxBackBufferUpload = nullptr;
+		}
+		HRESULT hCreate = g_pD3DDevice->CreateOffscreenPlainSurface(
+			Width, Height, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &g_pXboxBackBufferUpload, nullptr);
+		if (FAILED(hCreate) || g_pXboxBackBufferUpload == nullptr) {
+			g_RenderStat_BackBufferUploadFails++;
+			g_pXboxBackBufferUpload = nullptr;
+			return;
+		}
+		g_XboxBackBufferUploadW = Width;
+		g_XboxBackBufferUploadH = Height;
+	}
+
+	D3DLOCKED_RECT LockedRect;
+	if (FAILED(g_pXboxBackBufferUpload->LockRect(&LockedRect, nullptr, 0))) {
+		g_RenderStat_BackBufferUploadFails++;
+		return;
+	}
+
+	// Copy row by row - the guest and host pitches rarely match.
+	const size_t BytesPerRow = (size_t)Width * 4;
+	for (UINT y = 0; y < Height; y++) {
+		memcpy((uint8_t *)LockedRect.pBits + (size_t)y * LockedRect.Pitch,
+		       pXboxData + (size_t)y * RowPitch,
+		       BytesPerRow);
+	}
+	g_pXboxBackBufferUpload->UnlockRect();
+
+	IDirect3DSurface9 *pHostRenderTarget = nullptr;
+	if (FAILED(g_pD3DDevice->GetRenderTarget(0, &pHostRenderTarget)) || pHostRenderTarget == nullptr) {
+		g_RenderStat_BackBufferUploadFails++;
+		return;
+	}
+
+	// StretchRect rather than UpdateSurface: the host target may be upscaled.
+	HRESULT hBlit = g_pD3DDevice->StretchRect(
+		g_pXboxBackBufferUpload, nullptr, pHostRenderTarget, nullptr, D3DTEXF_LINEAR);
+	pHostRenderTarget->Release();
+
+	if (FAILED(hBlit)) {
+		g_RenderStat_BackBufferUploadFails++;
+	}
+	else {
+		g_RenderStat_BackBufferUploads++;
+	}
+}
+
 void CxbxUpdateNativeD3DResources()
 {
 	PERF_SCOPE(PERF_CAT_UPDATE_NATIVE);
+
+	// Once per frame, before the first draw lands on top of it.
+	if (g_bXboxBackBufferUploadPending) {
+		g_bXboxBackBufferUploadPending = false;
+		CxbxUploadXboxBackBufferToHost();
+	}
 	{
 		PERF_SCOPE(PERF_CAT_VTX_DECL);
 		{ PERF_SCOPE(PERF_CAT_VS_DECL); CxbxUpdateHostVertexDeclaration(); }
+		// Pick up any vertex shader constants the title wrote straight into the
+		// push buffer before this draw - this engine uploads its whole bone
+		// palette that way, through no Direct3D entry point at all.
+		// Must run BEFORE the constants are pushed to the host.
+		{ PERF_SCOPE(PERF_CAT_VS_CONST); CxbxrDrainXboxPushBufferConstants(); }
 		{ PERF_SCOPE(PERF_CAT_VS_CONST); CxbxUpdateHostVertexShaderConstants(); }
 		{ PERF_SCOPE(PERF_CAT_VIEWPORT); CxbxUpdateHostViewport(); }
 	}
@@ -8439,7 +9259,6 @@ void CxbxUpdateNativeD3DResources()
     if (!g_DisablePixelShaders) {
         DxbxUpdateActivePixelShader();
     }
-
 
 /* TODO : Port these :
 	DxbxUpdateDeferredStates(); // BeginPush sample shows us that this must come *after* texture update!
@@ -9510,7 +10329,6 @@ xbox::void_xt WINAPI xbox::EMUPATCH(D3DDevice_DeleteVertexShader)
 }
 
 
-
 // ******************************************************************
 // * patch: D3DDevice_GetShaderConstantMode
 // ******************************************************************
@@ -9894,6 +10712,324 @@ xbox::X_D3DVertexShader *CxbxrGetXboxCurrentVertexShader()
 	}
 
 	return pXboxVertexShader;
+}
+
+// The vertex shader PROGRAM START ADDRESS, read from the same device structure.
+//
+// Cxbx picks which uploaded program to compile from
+// g_Xbox_VertexShader_FunctionSlots_StartAddress, which only our own
+// SetVertexShader / SelectVertexShader patches ever write. On this title that
+// variable is stale for every world draw, because the 3D renderer does not select
+// shaders the way Cxbx assumes:
+//
+//   SimpleShader::ActivateVertexShader / WaterRenderer / SkyInstance / VertexBuffer::Activate
+//     -> Device::SetActiveVertexShaderInputs
+//        -> D3DDevice_SelectVertexShaderDirect (0x00209510)   <- NOT patched
+//
+// and SetActiveVertexShaderInputs passes pVertexAttributeFormat = NULL once its
+// "inputs already active" latch is set, which takes the branch at 0x0020953E that
+// re-points the program WITHOUT calling D3DDevice_SelectVertexShader (0x00209580)
+// at all - it just writes the pushbuffer and the device field:
+//     0020956C  mov [esi+0x79C], ecx     ; device.m_VertexShaderStartAddress = Address
+// The world therefore switches vertex programs (skinning, water, sky, foliage)
+// with no call any Cxbx patch can observe, so every world draw got compiled from
+// whichever address was last seen - the wrong program.
+//
+// The device field is authoritative because BOTH branches write it:
+//   0x0020956C  SelectVertexShaderDirect bypass branch
+//   0x0020961A  SelectVertexShader+0x9A
+//   0x00209E30  SetVertexShader+0xA0
+// Layout is contiguous and proven by disassembly: +0x794 shader pointer,
+// +0x798 handle, +0x79C start address - so the offset is derived from the
+// D3DDevice__m_VertexShader_OFFSET symbol rather than hard-coded.
+static xbox::dword_xt *g_pXbox_VertexShaderStartAddress = nullptr;
+static bool            g_bXbox_VertexShaderStartAddressUnavailable = false;
+
+bool CxbxrGetXboxVertexShaderStartAddress(xbox::dword_xt *pAddress)
+{
+	if (g_pXbox_VertexShaderStartAddress == nullptr) {
+		if (g_bXbox_VertexShaderStartAddressUnavailable) {
+			return false;
+		}
+
+		auto itDevice = g_SymbolAddresses.find("D3D_g_pDevice");
+		auto itOffset = g_SymbolAddresses.find("D3DDevice__m_VertexShader_OFFSET");
+		if (itDevice == g_SymbolAddresses.end() || itDevice->second == 0
+		 || itOffset == g_SymbolAddresses.end() || itOffset->second == 0) {
+			g_bXbox_VertexShaderStartAddressUnavailable = true;
+			return false;
+		}
+
+		uint8_t *pXboxDevice = *(uint8_t **)(itDevice->second);
+		if (pXboxDevice == nullptr) {
+			return false; // Xbox CreateDevice hasn't run yet - retry next call
+		}
+
+		// +8 past the shader pointer: shader, handle, then start address.
+		auto pStartAddress = (xbox::dword_xt *)(pXboxDevice + itOffset->second + 8);
+		if (!g_VMManager.IsValidVirtualAddress((VAddr)pStartAddress)) {
+			EmuLog(LOG_LEVEL::WARNING, "Xbox device vertex shader start-address field at 0x%08X"
+				" is not mapped - falling back to the SelectVertexShader shadow variable",
+				(uint32_t)(uintptr_t)pStartAddress);
+			g_bXbox_VertexShaderStartAddressUnavailable = true;
+			return false;
+		}
+
+		EmuLog(LOG_LEVEL::INFO, "Xbox vertex shader start-address field located at 0x%08X"
+			" (D3D__Device 0x%08X + 0x%X)",
+			(uint32_t)(uintptr_t)pStartAddress, (uint32_t)(uintptr_t)pXboxDevice, itOffset->second + 8);
+
+		g_pXbox_VertexShaderStartAddress = pStartAddress;
+	}
+
+	*pAddress = *g_pXbox_VertexShaderStartAddress;
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// Vertex shader constants the title pushes STRAIGHT INTO THE PUSH BUFFER
+// ---------------------------------------------------------------------------
+//
+// Skinned characters were invisible while rigid geometry drew correctly. The
+// translated shader is not at fault - the generated HLSL and the compiled
+// vs_3_0 bytecode were both read and index the bone rows correctly. The bone
+// matrices simply never arrive.
+//
+// This engine uploads its bone palette by hand-writing NV2A methods, not
+// through any Direct3D entry point:
+//
+//   0x00126DEE  (game .text)
+//     call  0x0012501E                    ; inlined D3DDevice_BeginPush(2 + 13*n, &p)
+//     mov   [p], 0x00041EA4               ; SET_TRANSFORM_CONSTANT_LOAD, 1 argument
+//     and   [p+4], 0                      ;   load address = 0
+//     p += 8
+//     per bone:
+//       mov [p], 0x00300B80               ; SET_TRANSFORM_CONSTANT, 12 dwords = 3 vec4
+//       call 0x00126847                   ;   builds the three matrix rows
+//       p += 0x34                         ;   (1 + 12 dwords)
+//     call  0x00125052                    ; inlined D3DDevice_EndPush(p)
+//
+// Three registers per bone starting at hardware constant 0 is exactly what
+// data\Shaders\VertexShaderConstants.h declares (VS_SKINNED_BONESTART = -96,
+// VS_SKINNED_MAXBONESPERPASS = (192 - (96 - 69)) / 3), and exactly what the
+// title's own skinning shader reads (mul r1, v1.z, c[a0.x+0..2]).
+//
+// BeginPush/EndPush are __forceinline in the XDK, so LTCG emitted private
+// copies inside the game's .text where Cxbx's D3D-section symbol scan cannot
+// find them - which is why the D3DDevice_BeginPush/EndPush patches Cxbx does
+// have never fire here. The result: g_EmuD3DVertexShaderConstants[0..164]
+// stayed zero, every skinned vertex collapsed onto a single clip position, and
+// the mesh disappeared while its rigid parts (eyeballs) still drew.
+//
+// The fix reads the push buffer the title is writing. D3D__pPushBuffer is not a
+// named symbol, but D3DDevice_SetVertexShaderConstantNotInlineFast IS resolved,
+// and its first instructions are literally:
+//     56              push esi
+//     57              push edi
+//     8B 3D <addr>    mov  edi, [D3D__pPushBuffer]
+//     8B F2           mov  esi, edx
+//     8B 44 24 0C     mov  eax, [esp+0xC]
+//     3B 3D <addr+4>  cmp  edi, [D3D__pPushBufferLimit]
+// so both globals are derived from a symbol we already have, with the byte
+// pattern verified before use.
+
+static xbox::dword_xt **g_ppXbox_PushBuffer = nullptr;      // D3D__pPushBuffer (write cursor)
+static xbox::dword_xt **g_ppXbox_PushBufferLimit = nullptr; // one past the usable end
+static xbox::dword_xt  *g_pXbox_PushDrained = nullptr;      // how far we have read
+static bool             g_bXbox_PushBufferUnavailable = false;
+
+// Counters (printf'd by RENDERSTATS - EmuLog is silent at LoggedModules = 0)
+unsigned g_PushConst_Drains = 0;      // scans that consumed at least one command
+unsigned g_PushConst_Registers = 0;   // constant registers recovered
+unsigned g_PushConst_Resyncs = 0;     // cursor moved backwards (buffer recycled)
+unsigned g_PushConst_LastLoad = 0;    // last SET_TRANSFORM_CONSTANT_LOAD address
+unsigned g_PushConst_MaxReg = 0;      // highest register written this way
+
+static bool CxbxrLocateXboxPushBuffer()
+{
+	if (g_ppXbox_PushBuffer != nullptr) {
+		return true;
+	}
+	if (g_bXbox_PushBufferUnavailable) {
+		return false;
+	}
+
+	auto it = g_SymbolAddresses.find("D3DDevice_SetVertexShaderConstantNotInlineFast");
+	if (it == g_SymbolAddresses.end() || it->second == 0) {
+		EmuLog(LOG_LEVEL::WARNING, "D3DDevice_SetVertexShaderConstantNotInlineFast not found -"
+			" push-buffer vertex shader constants cannot be recovered");
+		g_bXbox_PushBufferUnavailable = true;
+		return false;
+	}
+
+	const uint8_t *pCode = (const uint8_t *)it->second;
+	if (!g_VMManager.IsValidVirtualAddress((VAddr)pCode)) {
+		printf("PUSHCONST: symbol address 0x%08X is not mapped\n", (uint32_t)it->second);
+		g_bXbox_PushBufferUnavailable = true;
+		return false;
+	}
+
+	// NOTE : this function is one Cxbx PATCHES, so its first bytes are a jump and
+	// the prologue cannot be read. The body is untouched though, and it both reads
+	// and writes the two globals we want:
+	//     +0x02  8B 3D <buf>    mov edi, [D3D__pPushBuffer]     (destroyed by the patch)
+	//     +0x0E  3B 3D <limit>  cmp edi, [D3D__pPushBufferLimit]
+	//     +0x3D  89 3D <buf>    mov [D3D__pPushBuffer], edi
+	// so scan past the patch for the store and the compare, and require them to be
+	// the adjacent pair the XDK declares them as.
+	uint32_t bufAddr = 0, limitAddr = 0;
+	for (unsigned i = 8; i < 0x60; i++) {
+		if (pCode[i] == 0x89 && pCode[i + 1] == 0x3D && bufAddr == 0) {
+			bufAddr = *(const uint32_t *)(pCode + i + 2);
+		}
+		else if (pCode[i] == 0x3B && pCode[i + 1] == 0x3D && limitAddr == 0) {
+			limitAddr = *(const uint32_t *)(pCode + i + 2);
+		}
+	}
+
+	if (bufAddr == 0 || limitAddr != bufAddr + 4) {
+		printf("PUSHCONST: could not locate D3D__pPushBuffer in %s at 0x%08X"
+			" (buf=0x%08X limit=0x%08X, head %02X %02X %02X %02X)\n",
+			it->first.c_str(), (uint32_t)it->second, bufAddr, limitAddr,
+			pCode[0], pCode[1], pCode[2], pCode[3]);
+		g_bXbox_PushBufferUnavailable = true;
+		return false;
+	}
+
+	auto ppBuffer = (xbox::dword_xt **)bufAddr;
+	auto ppLimit  = (xbox::dword_xt **)limitAddr;
+
+	if (!g_VMManager.IsValidVirtualAddress((VAddr)ppBuffer)
+	 || !g_VMManager.IsValidVirtualAddress((VAddr)ppLimit)) {
+		printf("PUSHCONST: D3D__pPushBuffer 0x%08X is not mapped\n", bufAddr);
+		g_bXbox_PushBufferUnavailable = true;
+		return false;
+	}
+
+	EmuLog(LOG_LEVEL::INFO, "D3D__pPushBuffer located at 0x%08X (limit at 0x%08X)",
+		(uint32_t)(uintptr_t)ppBuffer, (uint32_t)(uintptr_t)ppLimit);
+	printf("PUSHCONST: D3D__pPushBuffer=0x%08X limit=0x%08X\n",
+		(uint32_t)(uintptr_t)ppBuffer, (uint32_t)(uintptr_t)ppLimit);
+
+	g_ppXbox_PushBuffer = ppBuffer;
+	g_ppXbox_PushBufferLimit = ppLimit;
+	g_pXbox_PushDrained = *ppBuffer;
+	return true;
+}
+
+// NV2A transform constant methods (see XbConvert.h)
+#define NV2A_METHOD_VP_UPLOAD_CONST_ID  0x00001EA4
+#define NV2A_METHOD_VP_UPLOAD_CONST_0   0x00000B80
+#define NV2A_METHOD_VP_UPLOAD_CONST_END 0x00000C00 // 32 dwords worth of methods
+
+void CxbxrDrainXboxPushBufferConstants()
+{
+	if (!CxbxrLocateXboxPushBuffer()) {
+		return;
+	}
+
+	xbox::dword_xt *pCur = *g_ppXbox_PushBuffer;
+	if (pCur == nullptr || !g_VMManager.IsValidVirtualAddress((VAddr)pCur)) {
+		return;
+	}
+
+	xbox::dword_xt *p = g_pXbox_PushDrained;
+	if (p == nullptr || p > pCur) {
+		// The Xbox D3D library recycled the buffer (D3DDevice_MakeSpace resets the
+		// cursor). Everything before this point is gone; resync and pick it up on
+		// the next pass. Bone palettes are re-pushed every frame, so at worst one
+		// object is a frame stale.
+		g_PushConst_Resyncs++;
+		g_pXbox_PushDrained = pCur;
+		return;
+	}
+	if (p == pCur) {
+		return; // nothing new
+	}
+
+	static unsigned s_ConstLoad = 0; // SET_TRANSFORM_CONSTANT_LOAD latch (survives commands)
+	float *pConstants = CxbxGetVertexShaderConstantFloat4Ptr(0);
+	bool *pDirty = CxbxGetVertexShaderConstantsDirtyFlags();
+	bool bConsumed = false;
+
+	// One-shot census of everything we parse out of the buffer. If the stream is
+	// being decoded correctly these are recognisable NV2A methods; if it is
+	// garbage they are scattered noise. Printed once, because EmuLog is silent
+	// at LoggedModules = 0.
+	static unsigned s_MethodCounts[0x800] = {};
+	static unsigned s_Commands = 0;
+	static bool s_CensusPrinted = false;
+
+	while (p < pCur) {
+		uint32_t word = *p++;
+		uint32_t instruction = word >> 29;
+		if (instruction != 0 /*increasing*/ && instruction != 2 /*non-increasing*/) {
+			break; // jump/call/return - stop and resync below
+		}
+
+		uint32_t method = (word >> 2) & 0x7FF;
+		uint32_t subchannel = (word >> 13) & 0x7;
+		uint32_t count = (word >> 18) & 0x7FF;
+
+		method <<= 2; // methods are stored shifted down by two
+
+		if (p + count > pCur) {
+			p--; // the command is still being written - come back for it next time
+			break;
+		}
+
+		s_Commands++;
+		s_MethodCounts[(method >> 2) & 0x7FF]++;
+
+		if (subchannel == 0) {
+			if (method == NV2A_METHOD_VP_UPLOAD_CONST_ID && count >= 1) {
+				s_ConstLoad = p[0];
+				g_PushConst_LastLoad = s_ConstLoad;
+				bConsumed = true;
+			}
+			else if (method >= NV2A_METHOD_VP_UPLOAD_CONST_0 && method < NV2A_METHOD_VP_UPLOAD_CONST_END) {
+				// Mirrors the NV2A: dwords fill one constant register at a time and
+				// the load pointer advances after every fourth component.
+				unsigned slot = (method - NV2A_METHOD_VP_UPLOAD_CONST_0) / 4;
+				for (uint32_t i = 0; i < count; i++) {
+					unsigned component = (slot + i) & 3;
+					if (s_ConstLoad < X_D3DVS_CONSTREG_COUNT) {
+						pConstants[s_ConstLoad * 4 + component] = *(const float *)&p[i];
+						pDirty[s_ConstLoad] = true;
+						if (s_ConstLoad > g_PushConst_MaxReg) g_PushConst_MaxReg = s_ConstLoad;
+						g_PushConst_Registers++;
+					}
+					if (component == 3) {
+						s_ConstLoad++;
+					}
+				}
+				bConsumed = true;
+			}
+		}
+
+		p += count;
+	}
+
+	if (bConsumed) {
+		g_PushConst_Drains++;
+	}
+	g_pXbox_PushDrained = pCur;
+
+	if (!s_CensusPrinted && s_Commands > 20000) {
+		s_CensusPrinted = true;
+		// Top methods, by count. Sanity check on the decode.
+		printf("PUSHCONST: census after %u commands, top methods (method=count):", s_Commands);
+		for (int n = 0; n < 12; n++) {
+			unsigned best = 0, bestIdx = 0;
+			for (unsigned m = 0; m < 0x800; m++) {
+				if (s_MethodCounts[m] > best) { best = s_MethodCounts[m]; bestIdx = m; }
+			}
+			if (best == 0) break;
+			printf(" 0x%04X=%u", bestIdx << 2, best);
+			s_MethodCounts[bestIdx] = 0;
+		}
+		printf("\n");
+	}
 }
 
 static xbox::dword_xt *g_pXbox_Fence = nullptr;    // &D3D__Device.m_Fence
@@ -10448,7 +11584,6 @@ xbox::hresult_xt WINAPI xbox::EMUPATCH(D3DDevice_GetModelView)(D3DXMATRIX* pMode
 	return D3D_OK;
 }
 
-
 DWORD PushBuffer[64 * 1024 / sizeof(DWORD)];
 
 // ******************************************************************
@@ -10566,7 +11701,6 @@ __declspec(naked) void WINAPI xbox::EMUPATCH(D3D_DestroyResource_0__LTCG_edi1)()
         ret
     }
 }
-
 
 // ******************************************************************
 // * patch: D3DDevice_SetRenderTargetFast

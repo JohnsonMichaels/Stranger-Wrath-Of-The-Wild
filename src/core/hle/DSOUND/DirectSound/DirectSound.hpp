@@ -29,6 +29,7 @@
 #include "core\kernel\init\CxbxKrnl.h"
 #include "core\hle\DSOUND\XbDSoundTypes.h"
 #include "core\hle\DSOUND\common\XbInternalStruct.hpp"
+#include "DirectSound3DVoice.hpp" // Cxbxr3DVoiceState: the Xbox 3D calculator's output, kept per voice
 
 typedef struct IDirectSound3DListener8* LPDIRECTSOUND3DLISTENER8;
 typedef struct IDirectSound3DBuffer8* LPDIRECTSOUND3DBUFFER8;
@@ -107,6 +108,8 @@ struct EmuDirectSoundBuffer
     REFERENCE_TIME          Xb_rtPauseEx;
     REFERENCE_TIME          Xb_rtStopEx;
     LONG                    Xb_VolumeMixbin;
+    Cxbxr3DVoiceState       Xb_3D;             // merged Set3DVoiceData output (volume offset, pan, doppler)
+    XbHybridDSBuffer*       Xb_OutputParent;   // submix this voice was routed into by SetOutputBuffer, or nullptr
     X_DSENVOLOPEDESC        Xb_EnvolopeDesc;
     X_DSVOICEPROPS          Xb_VoiceProperties;
     DWORD                   Xb_Flags;
@@ -329,6 +332,8 @@ class X_CDirectSoundStream
         REFERENCE_TIME                          Xb_rtFlushEx;
         REFERENCE_TIME                          Xb_rtPauseEx;
         LONG                                    Xb_VolumeMixbin;
+        Cxbxr3DVoiceState                       Xb_3D;             // kept in step with EmuDirectSoundBuffer::Xb_3D
+        XbHybridDSBuffer*                       Xb_OutputParent;   // kept in step with EmuDirectSoundBuffer::Xb_OutputParent
         X_DSENVOLOPEDESC                        Xb_EnvolopeDesc;
         X_DSVOICEPROPS                          Xb_VoiceProperties;
         DWORD                                   Host_dwLastWritePos;

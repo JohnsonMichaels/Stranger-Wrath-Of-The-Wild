@@ -1,0 +1,120 @@
+diff --git a/src/OOVPADatabase/D3D8LTCG/5849.inl b/src/OOVPADatabase/D3D8LTCG/5849.inl
+index 61dec20..a6799a4 100644
+--- a/src/OOVPADatabase/D3D8LTCG/5849.inl
++++ b/src/OOVPADatabase/D3D8LTCG/5849.inl
+@@ -43,10 +43,30 @@ OOVPA_SIG_MATCH(
+ );
+ 
+ // ******************************************************************
+-// * D3DDevice_SetPixelShader
+-// ******************************************************************
++// * D3DDevice_SetPixelShaderProgram
++// ******************************************************************
++// * NOTE: This signature used to be registered as D3DDevice_SetPixelShader.
++// * It is not that function - the body it matches is SetPixelShaderProgram's:
++// * it builds the device-owned scratch X_PixelShader { RefCount = 1,
++// * D3DOwned = 0, pPSDef = argument } at pDevice + 0x924 and then tail-calls
++// * the real SetPixelShader with that struct pointer in EAX. The two bytes
++// * this OOVPA keys on, "C7 00 01 00 00 00" at +0x14 and "C7 81 28 09" at
++// * +0x1A, ARE that RefCount = 1 / D3DOwned = 0 construction.
++// *
++// * Verified against Oddworld: Stranger's Wrath (2004-05-22 "Final",
++// * D3D8LTCG 5849), whose own PDB names the two functions and their sizes:
++// *   D3DDevice_SetPixelShaderProgram  RVA 0x1F82D0  60 bytes -> XBE 0x208BF0
++// *   D3DDevice_SetPixelShader         RVA 0x1F8310 505 bytes -> XBE 0x208C30
++// * (delta 0x10920, cross-checked on 97 other D3D symbols, all exact.)
++// *
++// * Patching SetPixelShader here handed CxbxImpl_SetPixelShader a
++// * D3DPIXELSHADERDEF* where it expected an X_PixelShader*, so pPSDef was read
++// * out of the middle of the shader data - a non-null garbage pointer that
++// * sailed past the null guard and access-violated in the 228-byte memcpy.
++// * The real function is covered by D3DDevice_SetPixelShader_0__LTCG_eax1
++// * (sig 2048), which matches 0x208C30 exactly.
+ //C70001000000C7812809
+-OOVPA_SIG_HEADER_NO_XREF(D3DDevice_SetPixelShader,
++OOVPA_SIG_HEADER_NO_XREF(D3DDevice_SetPixelShaderProgram,
+                          1048)
+ OOVPA_SIG_MATCH(
+ 
+diff --git a/src/OOVPADatabase/D3D8LTCG_OOVPA.c b/src/OOVPADatabase/D3D8LTCG_OOVPA.c
+index 9a048aa..49a739b 100644
+--- a/src/OOVPADatabase/D3D8LTCG_OOVPA.c
++++ b/src/OOVPADatabase/D3D8LTCG_OOVPA.c
+@@ -228,14 +228,16 @@ static OOVPATable D3D8LTCG_OOVPA_Table[] = {
+                     SYM_SIG(1024, 1036, 1048)),
+     REGISTER_OOVPAS(SYM_FUN_LTCG(D3DDevice_SetPalette, CALL(unk), STACK(4), PARAMS(PARAM(eax, Stage), PARAM(psh, pPalette))),
+                     SYM_SIG(2024)),
++    // NOTE: 1048 was removed from this list - that signature matches
++    // D3DDevice_SetPixelShaderProgram, not SetPixelShader. See D3D8LTCG/5849.inl.
+     REGISTER_OOVPAS(SYM_FUN(D3DDevice_SetPixelShader, CALL(std), STACK(/*default*/), PARAMS(PARAM(psh, Handle))),
+-                    SYM_SIG(1024, 1036, 1048)),
++                    SYM_SIG(1024, 1036)),
+     REGISTER_OOVPAS(SYM_FUN(D3DDevice_SetPixelShaderConstant, CALL(std), STACK(/*default*/), PARAMS(PARAM(psh, Register), PARAM(psh, pConstantData), PARAM(psh, ConstantCount))),
+                     SYM_SIG(1024, 1036)),
+     REGISTER_OOVPAS(SYM_FUN_LTCG(D3DDevice_SetPixelShaderConstant, CALL(unk), STACK(4), PARAMS(PARAM(ecx, Register), PARAM(psh, pConstantData), PARAM(eax, ConstantCount))),
+                     SYM_SIG(2024)),
+     REGISTER_OOVPAS(SYM_FUN(D3DDevice_SetPixelShaderProgram, CALL(std), STACK(/*default*/), PARAMS(PARAM(psh, pPSDef))),
+-                    SYM_SIG(1024)),
++                    SYM_SIG(1024, 1048)), // 1048 was mislabelled as D3DDevice_SetPixelShader; see D3D8LTCG/5849.inl
+     REGISTER_OOVPAS(SYM_FUN_LTCG(D3DDevice_SetPixelShader, CALL(unk), STACK(0), PARAMS(PARAM(eax, Handle))),
+                     SYM_SIG(2024, 2036, 2048, 2060, 2072)),
+     REGISTER_OOVPAS_M(SYM_INT(D3DDevice_SetRenderStateInline__GenericFragment),
+diff --git a/src/lib/libXbSymbolDatabase.c b/src/lib/libXbSymbolDatabase.c
+index bdb743a..f2614f9 100644
+--- a/src/lib/libXbSymbolDatabase.c
++++ b/src/lib/libXbSymbolDatabase.c
+@@ -434,6 +434,54 @@ const char* XbSDB_SymbolReferenceToString(uint32_t xref_index)
+ //       Otherwise, internal scan and XbSDB_LibraryToString will not function correctly.
+ uint32_t XbSDB_LibraryToFlag(const char* library_name)
+ {
++    // Debug-linked XDK builds name their libraries with a trailing 'D'
++    // (D3D8D, DSOUNDD, XAPILIBD, ...). They are the same APIs, so map them
++    // onto the retail flags instead of leaving the title unrecognised.
++    //
++    // Without this a debug build reports no D3D8 library at all, EmuUpdateLLEStatus
++    // forces bLLE_GPU on ("Fallback to LLE GPU."), every D3D patch is then skipped
++    // as "LLE GPU Enabled", and the game runs with no real device - no visible
++    // render window and garbage viewport/depth state handed back to the title.
++    if (strncmp(library_name, LIB_D3D8 "D", 8) == 0) {
++        return XBSDBLIB_D3D8;
++    }
++    if (strncmp(library_name, LIB_D3DX8 "D", 8) == 0) {
++        return XBSDBLIB_D3DX8;
++    }
++    if (strncmp(library_name, LIB_DSOUND "D", 8) == 0) {
++        return XBSDBLIB_DSOUND;
++    }
++    if (strncmp(library_name, LIB_XAPILIB "D", 8) == 0) {
++        return XBSDBLIB_XAPILIB;
++    }
++    if (strncmp(library_name, LIB_XGRAPHC "D", 8) == 0) {
++        return XBSDBLIB_XGRAPHC;
++    }
++    // Instrumented ('I' suffix) XDK builds: D3D8I, DSOUNDI, XAPILIBI, XGRAPHCI.
++    // Same APIs as retail with profiling hooks added, so map them onto the retail
++    // flags too - otherwise the same "Fallback to LLE GPU." path described above
++    // swallows every D3D patch. (LIB_D3DX8 "I" would be 7 chars, still fine for
++    // the 8-byte fixed-size library names in the XBE header.)
++    if (strncmp(library_name, LIB_D3D8 "I", 8) == 0) {
++        return XBSDBLIB_D3D8;
++    }
++    if (strncmp(library_name, LIB_D3DX8 "I", 8) == 0) {
++        return XBSDBLIB_D3DX8;
++    }
++    if (strncmp(library_name, LIB_DSOUND "I", 8) == 0) {
++        return XBSDBLIB_DSOUND;
++    }
++    if (strncmp(library_name, LIB_XAPILIB "I", 8) == 0) {
++        return XBSDBLIB_XAPILIB;
++    }
++    if (strncmp(library_name, LIB_XGRAPHC "I", 8) == 0) {
++        return XBSDBLIB_XGRAPHC;
++    }
++    // XACTENG's debug name is XACTENID, not XACTENGD.
++    if (strncmp(library_name, "XACTENID", 8) == 0) {
++        return XBSDBLIB_XACTENG;
++    }
++
+     if (strncmp(library_name, LIB_D3D8, 8) == 0) {
+         return XBSDBLIB_D3D8;
+     }

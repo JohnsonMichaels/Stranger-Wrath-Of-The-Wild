@@ -768,19 +768,53 @@ XBSYSAPI EXPORTNUM(277) xbox::void_xt NTAPI xbox::RtlEnterCriticalSection
     }
     else {
         if(CriticalSection->OwningThread != thread) {
-			if (CriticalSection->OwningThread != nullptr) {
-				NTSTATUS result;
-				result = KeWaitForSingleObject(
+			// Wait in a TIMED, RE-CHECKING loop.
+			//
+			// The original was a single untimed wait followed by an unconditional
+			// claim of ownership - it assumed that waking means the section is free,
+			// and never re-tested. It also skipped the wait entirely whenever
+			// OwningThread happened to read as nullptr, which is exactly the window
+			// another thread sits in between decrementing LockCount and clearing
+			// ownership in RtlLeaveCriticalSection. Either path lets two threads
+			// believe they own the section; the bookkeeping then desynchronises and a
+			// later waiter blocks on a section whose owner will never signal it.
+			//
+			// Measured symptom: loading region_03 (Mongo Valley) parks FIVE guest
+			// threads in NtWaitForAlertByThreadId at one guest return address while
+			// the renderer keeps drawing the loading screen. Region_01 loads fewer
+			// assets across fewer threads and wins the race.
+			//
+			// The timeout makes a lost wakeup recoverable instead of terminal, and
+			// gives the loop somewhere to report from - an untimed wait that never
+			// returns cannot diagnose itself.
+			xbox::LARGE_INTEGER Timeout;
+			Timeout.QuadPart = -10000000LL; // 1 second, relative
+			unsigned Spins = 0;
+			while (CriticalSection->OwningThread != nullptr
+			    && CriticalSection->OwningThread != thread) {
+				NTSTATUS result = KeWaitForSingleObject(
 					(PVOID)CriticalSection,
 					(KWAIT_REASON)0,
 					(KPROCESSOR_MODE)0,
 					(boolean_xt)0,
-					(PLARGE_INTEGER)0
+					&Timeout
 				);
 				if (!X_NT_SUCCESS(result))
 				{
 					CxbxrAbort("Waiting for event of a critical section returned %lx.", result);
 				};
+
+				if (++Spins == 3 || (Spins % 30) == 0) {
+					// Still blocked after seconds - name the section and its state so
+					// a genuine deadlock is distinguishable from mere contention.
+					printf("CRITSEC: thread %p waiting %u s on section %p "
+						"(LockCount=%ld RecursionCount=%ld OwningThread=%p)\n",
+						(void *)thread, Spins, (void *)CriticalSection,
+						(long)CriticalSection->LockCount,
+						(long)CriticalSection->RecursionCount,
+						(void *)CriticalSection->OwningThread);
+					fflush(stdout);
+				}
 			}
             CriticalSection->OwningThread = thread;
             CriticalSection->RecursionCount = 1;

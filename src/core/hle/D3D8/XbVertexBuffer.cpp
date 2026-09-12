@@ -54,6 +54,19 @@ CxbxVertexBufferConverter VertexBufferConverter = {};
 xbox::X_D3DPRIMITIVETYPE      g_InlineVertexBuffer_PrimitiveType = xbox::X_D3DPT_INVALID;
 xbox::X_VERTEXATTRIBUTEFORMAT g_InlineVertexBuffer_AttributeFormat = {};
 bool                          g_InlineVertexBuffer_DeclarationOverride = false;
+// Counts host vertex-buffer write overruns caught in ConvertStream. Reported via
+// RENDERSTATS (printf) because EmuLog is silent under LoggedModules = 0x0.
+unsigned                      g_VertexStat_Overruns = 0;
+// Vertex buffers larger than the pool's biggest bucket (2 MB). These used to be
+// silently served a 2 MB buffer, which is what crashed ConvertStream.
+unsigned                      g_VertexStat_OversizeVertexBuffers = 0;
+// Draw batches thrown away because the vertex declaration referenced a stream with
+// no Xbox vertex buffer behind it. Each one is geometry that never reaches screen.
+unsigned                      g_VertexStat_DroppedUnboundStream = 0;
+unsigned                      g_VertexStat_LastUnboundStreamIndex = 0;
+// Failed CreateVertexBuffer calls. A failure makes the caller skip the draw, so it
+// shows up as geometry vanishing rather than as an error.
+unsigned                      g_VertexStat_VertexBufferAllocFailures = 0;
 std::vector<D3DIVB>           g_InlineVertexBuffer_Table;
 UINT                          g_InlineVertexBuffer_TableLength = 0;
 UINT                          g_InlineVertexBuffer_TableOffset = 0;
@@ -212,13 +225,32 @@ void CxbxVertexBufferConverter::DrawCacheStats()
 	ImGui::TextWrapped("Data not in cache: %u", std::exchange(m_DataNotInCacheMisses, 0));
 }
 
-// ── Vertex Buffer Pool ────────────────────────────────────────────────────────
+// ?????? Vertex Buffer Pool ????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
 // Recycles D3D vertex buffers to avoid Create/Release overhead on cache misses.
 // Buckets are sized in powers of 2 (256 B to 2 MB). Max 32 VBs per bucket.
 static constexpr int VB_POOL_MIN_BUCKET = 8;   // 2^8  = 256 bytes
+// Raised from 21 (2 MB) to 25 (32 MB). This engine routinely asks for more than
+// 2 MB - 65,535 vertices at a 32-byte host stride is already 2.1 MB, and terrain
+// meshes are bigger. With the old ceiling those requests fell outside the pool
+// entirely and had to be served by a fresh exact-size CreateVertexBuffer that was
+// released again immediately, hundreds of times per session (oversizeVBs=783 in one
+// run). That churn fragments video memory until CreateVertexBuffer starts failing,
+// and a failed allocation means the draw is skipped - which shows up as geometry
+// progressively disappearing, largest meshes first: the ground goes, then more.
+// Bucketing them means they get REUSED instead of reallocated.
+// REVERTED to 21 (2 MB). Raising this to 25 was speculative - it chased a video
+// memory exhaustion theory that the vbAllocFailures counter then disproved (it
+// stayed at 0). The build that rendered Tutorial Town correctly had the 2 MB
+// ceiling with oversized requests served exact-size and never pooled, so that is
+// what we return to. The -1 / exact-size logic below is the part that fixed the
+// crash and is KEPT; only the ceiling is restored.
 static constexpr int VB_POOL_MAX_BUCKET = 21;   // 2^21 = 2 MB
 static constexpr int VB_POOL_NUM_BUCKETS = VB_POOL_MAX_BUCKET - VB_POOL_MIN_BUCKET + 1;
 static constexpr int VB_POOL_MAX_PER_BUCKET = 32;
+// Large buckets are capped much lower, or the pool itself could pin ~1 GB.
+// 4 each across the 2/4/8/16/32 MB buckets is ~250 MB worst case.
+static constexpr DWORD VB_POOL_LARGE_THRESHOLD = 1u << 20; // 1 MB
+static constexpr int   VB_POOL_MAX_PER_LARGE_BUCKET = 4;
 
 struct VBPoolBucket {
 	IDirect3DVertexBuffer* vbs[VB_POOL_MAX_PER_BUCKET];
@@ -237,12 +269,32 @@ static void VBPool_Init()
 	g_VBPoolInitialized = true;
 }
 
+// Returns the smallest power-of-2 bucket that fits 'size', or -1 when 'size' is
+// larger than the biggest bucket (2 MB).
+//
+// The -1 case is the bug that crashed this title. The original loop was
+//     while (bucketSize < size && idx < VB_POOL_NUM_BUCKETS - 1) { ... }
+// whose second condition stops the walk at the last bucket EVEN WHEN bucketSize is
+// still smaller than size. Every request over 2 MB therefore silently received a
+// 2 MB buffer, and ConvertStream then wrote past the end of it - an access
+// violation a little way past a valid allocation, which is exactly what we saw:
+// repeated faults at CxbxVertexBufferConverter::ConvertStream writing addresses a
+// few bytes apart across runs, never wild pointers.
+//
+// 2 MB is not an exotic size here: 65,535 vertices at a 32-byte host stride is
+// 2.1 MB, and this engine draws meshes that big.
+//
+// The bounds check inside ConvertStream did not catch it because that compares
+// against dwHostVertexDataSize - the size we ASKED for - not the size we were
+// actually handed back.
 static int VBPool_BucketIndex(DWORD size)
 {
-	// Find the smallest power-of-2 bucket that fits 'size'
 	int idx = 0;
 	DWORD bucketSize = 1u << VB_POOL_MIN_BUCKET;
-	while (bucketSize < size && idx < VB_POOL_NUM_BUCKETS - 1) {
+	while (bucketSize < size) {
+		if (idx >= VB_POOL_NUM_BUCKETS - 1) {
+			return -1; // too large for any bucket - must not be pooled
+		}
 		idx++;
 		bucketSize <<= 1;
 	}
@@ -254,19 +306,42 @@ static IDirect3DVertexBuffer* VBPool_Acquire(DWORD size)
 	if (!g_VBPoolInitialized) VBPool_Init();
 
 	int idx = VBPool_BucketIndex(size);
+	if (idx < 0) {
+		// Beyond even the 32 MB bucket. Allocate exactly what was asked for and keep
+		// it out of the pool - pooling a non-power-of-2 buffer would let a later,
+		// larger request pop one too small for it and reintroduce the overrun a size
+		// class down. This should now be rare; if it is not, raise VB_POOL_MAX_BUCKET.
+		g_VertexStat_OversizeVertexBuffers++;
+		IDirect3DVertexBuffer* vb = nullptr;
+		HRESULT hRet = g_pD3DDevice->CreateVertexBuffer(
+			size,
+			D3DUSAGE_WRITEONLY | D3DUSAGE_DYNAMIC,
+			0, D3DPOOL_DEFAULT, &vb, nullptr);
+		if (FAILED(hRet)) {
+			g_VertexStat_VertexBufferAllocFailures++;
+			return nullptr;
+		}
+		return vb;
+	}
+
 	auto& bucket = g_VBPool[idx];
 
 	if (bucket.count > 0) {
 		return bucket.vbs[--bucket.count]; // Pop from pool
 	}
 
-	// Pool empty — create a new VB at bucket size
+	// Pool empty ??? create a new VB at bucket size
 	IDirect3DVertexBuffer* vb = nullptr;
 	HRESULT hRet = g_pD3DDevice->CreateVertexBuffer(
 		bucket.allocSize,
 		D3DUSAGE_WRITEONLY | D3DUSAGE_DYNAMIC,
 		0, D3DPOOL_DEFAULT, &vb, nullptr);
-	if (FAILED(hRet)) return nullptr;
+	if (FAILED(hRet)) {
+		// A failed allocation means the caller skips the draw, so this shows up as
+		// geometry silently vanishing rather than as an error. Count it.
+		g_VertexStat_VertexBufferAllocFailures++;
+		return nullptr;
+	}
 	return vb;
 }
 
@@ -277,9 +352,20 @@ static void VBPool_Return(IDirect3DVertexBuffer* vb)
 	vb->GetDesc(&desc);
 
 	int idx = VBPool_BucketIndex(desc.Size);
+	if (idx < 0) {
+		vb->Release(); // oversize, exact-sized allocation - never pooled
+		return;
+	}
+
 	auto& bucket = g_VBPool[idx];
 
-	if (bucket.count < VB_POOL_MAX_PER_BUCKET) {
+	// Keep far fewer of the big ones resident - the large buckets now go up to
+	// 32 MB, and 32 of those per bucket would pin about a gigabyte.
+	const int MaxForThisBucket = (bucket.allocSize > VB_POOL_LARGE_THRESHOLD)
+		? VB_POOL_MAX_PER_LARGE_BUCKET
+		: VB_POOL_MAX_PER_BUCKET;
+
+	if (bucket.count < MaxForThisBucket) {
 		bucket.vbs[bucket.count++] = vb; // Return to pool
 	} else {
 		vb->Release(); // Pool full, release
@@ -357,6 +443,12 @@ void CxbxVertexBufferConverter::ConvertStream
 			// references this stream, and drawing with a declared-but-unbound stream faults
 			// *inside* the host d3d9 runtime instead of returning D3DERR_INVALIDCALL. Flag
 			// it so the caller drops the draw.
+			// Skinned characters (Stranger, the Clakkerz) are the geometry most
+			// likely to declare more than one stream, so if whole characters are
+			// missing while static world geometry draws, this counter is the first
+			// thing to look at - every increment is one batch thrown away.
+			g_VertexStat_DroppedUnboundStream++;
+			g_VertexStat_LastUnboundStreamIndex = uiStream;
 			g_bCxbxDrawHasUnboundStream = true;
 			return;
 		}
@@ -468,6 +560,33 @@ void CxbxVertexBufferConverter::ConvertStream
 				(unsigned long long)ui64RequiredSize, dwHostVertexDataSize);
 			return;
 		}
+
+		// The conversion loop below walks each vertex at uiHostVertexStride and
+		// writes NumberOfVertexElements fields into that slot. If those fields
+		// total MORE than the stride, every vertex overflows its own slot and
+		// the last one leaves the buffer entirely - a small overrun, which is
+		// what the observed faults look like (adjacent addresses, not wild
+		// pointers). Measure it rather than guess: three guesses at this crash
+		// were guarded and all three fired zero times.
+		if (bNeedVertexPatching && pVertexShaderStreamInfo != nullptr) {
+			UINT uiElementBytes = 0;
+			for (UINT i = 0; i < pVertexShaderStreamInfo->NumberOfVertexElements; i++) {
+				uiElementBytes += pVertexShaderStreamInfo->VertexElements[i].HostByteSize;
+			}
+			if (uiElementBytes > uiHostVertexStride) {
+				EmuLog(LOG_LEVEL::WARNING,
+					"VERTEX OVERRUN: %u elements total %u bytes but host stride is only %u "
+					"(xbox stride %u, %u verts) - each vertex overflows its slot by %u bytes; skipping",
+					pVertexShaderStreamInfo->NumberOfVertexElements, uiElementBytes,
+					uiHostVertexStride, uiXboxVertexStride, uiVertexCount,
+					uiElementBytes - uiHostVertexStride);
+				return;
+			}
+			EmuLog(LOG_LEVEL::DEBUG,
+				"stream ok: %u elements = %u bytes, host stride %u, xbox stride %u, %u verts",
+				pVertexShaderStreamInfo->NumberOfVertexElements, uiElementBytes,
+				uiHostVertexStride, uiXboxVertexStride, uiVertexCount);
+		}
 	}
 
     // Allocate new buffers
@@ -493,9 +612,45 @@ void CxbxVertexBufferConverter::ConvertStream
 	
 	if (bNeedVertexPatching) {
 	    // assert(bNeedStreamCopy || "bNeedVertexPatching implies bNeedStreamCopy (but copies via conversions");
+		//
+		// Report the FIRST out-of-range write instead of taking an access
+		// violation. Four separate hypotheses about this crash (null vertex
+		// declaration, 32-bit size overflow, null texture stages, elements
+		// summing past the stride) were each guarded and each fired zero times.
+		// Rather than guess a fifth time, make the loop state its own bounds.
+		const uint8_t* const pHostBufEnd = pHostVertexData + dwHostVertexDataSize;
+		bool bReportedOverrun = false;
+
 		for (uint32_t uiVertex = 0; uiVertex < uiVertexCount; uiVertex++) {
 			uint8_t *pXboxVertexAsByte = &pXboxVertexData[uiVertex * uiXboxVertexStride];
 			uint8_t *pHostVertexAsByte = &pHostVertexData[uiVertex * uiHostVertexStride];
+
+			if (pHostVertexAsByte + uiHostVertexStride > pHostBufEnd) {
+				if (!bReportedOverrun) {
+					bReportedOverrun = true;
+					// printf, NOT EmuLog. This title runs with LoggedModules = 0x0,
+					// under which EmuLog produces nothing at all - the whole log
+					// contains zero WARNING lines. The earlier note above claiming
+					// four hypotheses "each fired zero times" was measured through
+					// EmuLog and is therefore WORTHLESS: those guards may have been
+					// firing every frame with the output silently discarded. Anything
+					// that has to survive a default configuration must use printf,
+					// the way RENDERSTATS does.
+					g_VertexStat_Overruns++;
+					if (g_VertexStat_Overruns <= 5) {
+						printf("VERTEX WRITE OUT OF RANGE at vertex %u of %u: host slot %p..%p "
+							"exceeds buffer %p..%p (size %u, host stride %u, xbox stride %u, "
+							"xbox src %p, elements %u)\n",
+							uiVertex, uiVertexCount,
+							pHostVertexAsByte, pHostVertexAsByte + uiHostVertexStride,
+							pHostVertexData, pHostBufEnd, dwHostVertexDataSize,
+							uiHostVertexStride, uiXboxVertexStride, pXboxVertexAsByte,
+							pVertexShaderStreamInfo ? pVertexShaderStreamInfo->NumberOfVertexElements : 0);
+						fflush(stdout);
+					}
+				}
+				break; // stop converting rather than corrupt the heap
+			}
 			for (UINT uiElement = 0; uiElement < pVertexShaderStreamInfo->NumberOfVertexElements; uiElement++) {
 				FLOAT *pXboxVertexAsFloat = (FLOAT*)pXboxVertexAsByte;
 				SHORT *pXboxVertexAsShort = (SHORT*)pXboxVertexAsByte;

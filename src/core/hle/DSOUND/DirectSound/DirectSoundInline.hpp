@@ -80,6 +80,25 @@ static inline void DSoundDebugMuteFlag(DWORD Xb_bufferBytes, DWORD &EmuFlags) {
 #endif
 
 static void DSoundBufferOutputXBtoHost(DWORD emuFlags, DSBUFFERDESC &DSBufferDesc, LPVOID pXBaudioPtr, DWORD dwXBAudioBytes, LPVOID pPCaudioPtr, DWORD dwPCMAudioBytes) {
+    // This is where Xbox audio data actually becomes host audio data. Sound effects
+    // are all XADPCM and inaudible while PCM music plays; they reach Play with valid
+    // buffers, normal volume and DS_OK, so the remaining question is whether their
+    // data ever arrives here to be decoded. Report the path taken, the byte counts,
+    // and whether the decoded result is anything other than silence - a buffer full
+    // of zeroes plays exactly like a sound that never started.
+    {
+        static unsigned s_Reported = 0;
+        if (++s_Reported <= 16) {
+            printf("DSOUND: XBtoHost %s xbBytes=%u pcmBytes=%u ch=%u bits=%u rate=%u\n",
+                ((emuFlags & DSE_FLAG_XADPCM) > 0) ? "XADPCM->decode" : "PCM->copy",
+                (unsigned)dwXBAudioBytes, (unsigned)dwPCMAudioBytes,
+                (unsigned)(DSBufferDesc.lpwfxFormat ? DSBufferDesc.lpwfxFormat->nChannels : 0),
+                (unsigned)(DSBufferDesc.lpwfxFormat ? DSBufferDesc.lpwfxFormat->wBitsPerSample : 0),
+                (unsigned)(DSBufferDesc.lpwfxFormat ? DSBufferDesc.lpwfxFormat->nSamplesPerSec : 0));
+            fflush(stdout);
+        }
+    }
+
     if ((emuFlags & DSE_FLAG_XADPCM) > 0) {
 
         TXboxAdpcmDecoder_Decode_Memory((uint8_t*)pXBaudioPtr, dwXBAudioBytes, (uint8_t*)pPCaudioPtr, DSBufferDesc.lpwfxFormat->nChannels);
@@ -87,6 +106,32 @@ static void DSoundBufferOutputXBtoHost(DWORD emuFlags, DSBUFFERDESC &DSBufferDes
     // PCM format, no changes requirement.
     } else {
         memcpy_s(pPCaudioPtr, dwPCMAudioBytes, pXBaudioPtr, dwPCMAudioBytes);
+    }
+
+    // Is the result audible? Scan the decoded output for any non-zero sample.
+    //
+    // ONLY for the XADPCM path. The first version of this checked the first 16
+    // buffers of ANY kind, and the first ten happened to be PCM - so it reported
+    // healthy peaks that belonged to the music, and said nothing at all about the
+    // effects. Measuring the wrong population is the same mistake as measuring
+    // through a logger that is switched off.
+    {
+        static unsigned s_Checked = 0;
+        if ((emuFlags & DSE_FLAG_XADPCM) > 0
+         && s_Checked < 16 && pPCaudioPtr != nullptr && dwPCMAudioBytes >= 64) {
+            s_Checked++;
+            const int16_t *pSamples = (const int16_t *)pPCaudioPtr;
+            const size_t Count = dwPCMAudioBytes / sizeof(int16_t);
+            int16_t Peak = 0;
+            for (size_t i = 0; i < Count; i++) {
+                int16_t v = pSamples[i];
+                if (v < 0) v = (int16_t)-v;
+                if (v > Peak) Peak = v;
+            }
+            printf("DSOUND:   -> decoded peak amplitude = %d %s\n",
+                (int)Peak, (Peak == 0) ? "<-- SILENCE" : "");
+            fflush(stdout);
+        }
     }
 }
 
@@ -313,6 +358,16 @@ static inline void GeneratePCMFormat(
         }
 
         DSBufferDesc.guid3DAlgorithm = DS3DALG_DEFAULT;
+
+        // Host pan is the only speaker placement a 2D host buffer has, and it is how
+        // the Xbox 3D calculator's azimuth reaches the speakers (Cxbxr3DVoice_PanMb ->
+        // HybridDirectSoundBuffer_SetPan3D). SetPan needs DSBCAPS_CTRLPAN, which the
+        // host refuses together with DSBCAPS_CTRL3D, on the primary buffer, and on
+        // more than two channels - so give it to every buffer that can take it.
+        if ((DSBufferDesc.dwFlags & (DSBCAPS_CTRL3D | DSBCAPS_PRIMARYBUFFER)) == 0
+         && DSBufferDesc.lpwfxFormat->nChannels <= 2) {
+            DSBufferDesc.dwFlags |= DSBCAPS_CTRLPAN;
+        }
     }
 
     if (X_BufferSizeRequest < DSBSIZE_MIN) {
@@ -404,6 +459,8 @@ static inline void DSound3DBufferCreate(LPDIRECTSOUNDBUFFER8 pDSBuffer, LPDIRECT
     pThis->X_BufferCacheSize = 0; \
     pThis->Xb_rtPauseEx = 0LL; \
     pThis->Xb_VolumeMixbin = 0L; \
+    Cxbxr3DVoice_Init(pThis->Xb_3D); \
+    pThis->Xb_OutputParent = nullptr; \
     pThis->Xb_EnvolopeDesc = { 0 }; \
     InitVoiceProperties(pThis->Xb_VoiceProperties); /* The rest will initialize in GeneratePCMFormat to GenerateMixBinDefault. */ \
     pThis->Xb_Flags = Xb_dwFlags;
@@ -731,6 +788,23 @@ static inline HRESULT DSoundBufferUpdateHostVolume(
     }
     if ((dwEmuFlags & DSE_FLAG_DEBUG_MUTE) > 0) {
         volume = DSBVOLUME_MIN;
+    }
+
+    // Sound effects are silent while music plays, and the two differ only by codec:
+    // music is PCM (emuFlags ...0001), every effect is Xbox ADPCM (...0002). The
+    // branches above force volume to DSBVOLUME_MIN when a codec is disabled, which
+    // plays the sound perfectly and inaudibly - indistinguishable from "the effect
+    // never played". Report the actual decision so the codec flags can be confirmed
+    // rather than assumed. printf: EmuLog is silent under LoggedModules = 0x0.
+    {
+        static unsigned s_VolReported = 0;
+        if (++s_VolReported <= 12) {
+            printf("DSOUND: volume=%ld emuFlags=0x%08X codecs[pcm=%d xadpcm=%d unknown=%d] %s\n",
+                (long)volume, (unsigned)dwEmuFlags,
+                (int)g_XBAudio.codec_pcm, (int)g_XBAudio.codec_xadpcm, (int)g_XBAudio.codec_unknown,
+                (volume == DSBVOLUME_MIN) ? "<-- MUTED" : "");
+            fflush(stdout);
+        }
     }
 
     return pDSBuffer->SetVolume(volume);
@@ -1175,7 +1249,8 @@ static inline HRESULT HybridDirectSoundBuffer_SetFormat(
     RETURN_RESULT_CHECK(hRet);
 }
 
-static HRESULT HybridDirectSoundBuffer_SetPitch(LPDIRECTSOUNDBUFFER8, LONG, xbox::CDirectSoundVoice*);
+// lPitchDelta3D: the 3D doppler pitch (1/4096 octave), applied on top of the voice pitch for the host only.
+static HRESULT HybridDirectSoundBuffer_SetPitch(LPDIRECTSOUNDBUFFER8, LONG, xbox::CDirectSoundVoice*, LONG lPitchDelta3D = 0);
 
 //IDirectSoundStream
 //IDirectSoundBuffer
@@ -1193,7 +1268,8 @@ static inline HRESULT HybridDirectSoundBuffer_SetFrequency(
     RETURN_RESULT_CHECK(hRet);
 }
 
-static HRESULT HybridDirectSoundBuffer_SetVolume(LPDIRECTSOUNDBUFFER8, LONG, DWORD, LONG, xbox::CDirectSoundVoice*);
+// lVolume3DMb: the 3D attenuation in mB (<= 0), added to the host volume on top of the voice volume and mixbin fold.
+static HRESULT HybridDirectSoundBuffer_SetVolume(LPDIRECTSOUNDBUFFER8, LONG, DWORD, LONG, xbox::CDirectSoundVoice*, LONG lVolume3DMb = 0);
 
 //IDirectSoundStream
 //IDirectSoundBuffer
@@ -1296,7 +1372,44 @@ static inline HRESULT HybridDirectSoundBuffer_SetMixBins(
 
     GenerateMixBinDefault(Xb_VoiceProperties, BufferDesc.lpwfxFormat, mixBins, ((BufferDesc.dwFlags & DSBCAPS_CTRL3D) > 0));
 
+    { // DSMIX SetMixBins trace: which bins did the title ask for, and what table resulted?
+        static unsigned s_Seen = 0;
+        if (++s_Seen <= 60) {
+            char Have[160]; size_t u = 0; Have[0] = 0;
+            for (unsigned i = 0; i < Xb_VoiceProperties.dwMixBinCount && i < 8 && u < sizeof(Have) - 24; ++i) {
+                u += (size_t)std::snprintf(Have + u, sizeof(Have) - u, "%s%u:%ld", i ? " " : "",
+                    (unsigned)Xb_VoiceProperties.MixBinVolumePairs[i].dwMixBin, (long)Xb_VoiceProperties.MixBinVolumePairs[i].lVolume);
+            }
+            printf("DSMIX: SetMixBins mask=0x%08X pMixBins=%p ctrl3d=%d -> table[%u]={%s}\n",
+                (unsigned)mixBins.dwMixBinMask, (void *)mixBins.pMixBins, (int)((BufferDesc.dwFlags & DSBCAPS_CTRL3D) > 0),
+                (unsigned)Xb_VoiceProperties.dwMixBinCount, Have);
+            fflush(stdout);
+        }
+    }
+
     return ret;
+}
+
+// Does this mixbin carry the voice's dry signal, i.e. does its level say how loud
+// the host buffer must be? Speaker bins 0,1,2,4,5 and the 3D speaker feeds 6..9
+// (6/7 = 3D front pair, 8/9 = 3D rear pair) do. Never 3 (LFE), never 10 (the I3DL2
+// reverb send) and never 11+ (FX sends): those are sends, not the dry level.
+//
+// The case that matters is a table of exactly {10, 3}. XACT plays a positional
+// effect as an ordinary track voice routed into a parent submix (SetOutputBuffer),
+// then gives the track only its reverb-send and LFE bins; the dry signal goes to
+// the parent, whose 3D data sets its level. Cxbx cannot route into a submix, so
+// the track's dry signal plays straight to the host - and muting it "because it
+// has no speaker bin" is exactly what silenced every positional effect while 2D
+// effects, which keep {0,1}, played.
+static inline bool DSoundMixBinScoresDryLevel(DWORD dwMixBin)
+{
+    constexpr DWORD k3DFrontLeft = 6;   // first 3D speaker feed (front pair 6/7)
+    constexpr DWORD k3DRearRight = 9;   // last 3D speaker feed (rear pair 8/9)
+    if (dwMixBin < XDSMIXBIN_SPEAKERS_MAX) {
+        return dwMixBin != XDSMIXBIN_LOW_FREQUENCY;
+    }
+    return dwMixBin >= k3DFrontLeft && dwMixBin <= k3DRearRight;
 }
 
 //IDirectSoundStream x2
@@ -1328,18 +1441,53 @@ static inline HRESULT HybridDirectSoundBuffer_SetMixBinVolumes_8(
         }
 
         // Since we cannot set per-channel volumes, we want to pick "dominant" volume
+        // among the bins that carry the dry signal (DSoundMixBinScoresDryLevel).
         LONG maxVolume = DSBVOLUME_MIN;
+        unsigned scored = 0;
         for(unsigned i = 0; i < Xb_VoiceProperties.dwMixBinCount; i++) {
             const auto& it_out = Xb_VoiceProperties.MixBinVolumePairs[i];
-            if (it_out.dwMixBin != XDSMIXBIN_LOW_FREQUENCY && it_out.dwMixBin < XDSMIXBIN_SPEAKERS_MAX) {
+            if (DSoundMixBinScoresDryLevel(it_out.dwMixBin)) {
+                scored++;
                 if (maxVolume < it_out.lVolume) {
                     maxVolume = it_out.lVolume;
                 }
             }
         }
+        // No dry bin at all: the table holds only send levels (reverb, LFE) and the
+        // dry level is defined elsewhere (the parent's 3D data), not by them. Do not mute.
+        if (scored == 0) {
+            maxVolume = 0;
+        }
 
         Xb_volumeMixBin = maxVolume;
         int32_t Xb_volume = Xb_Voice->GetVolume() + Xb_Voice->GetHeadroom();
+
+        // DSMIX fold trace. The fold above WAS the mute for positional voices: it used
+        // to score only bins < XDSMIXBIN_SPEAKERS_MAX (6), so the 3D default table
+        // {6,8,7,9,10} or a send-only table {10,3} left maxVolume at DSBVOLUME_MIN no
+        // matter what the title sent. Report what came in, what was already there,
+        // what went out and which path decided it, so the fix stays a measurement.
+        {
+            static unsigned s_Seen = 0;
+            if (++s_Seen <= 60) {
+                char In[160]; size_t u = 0; In[0] = 0;
+                for (unsigned i = 0; pMixBins != xbox::zeroptr && i < pMixBins->dwCount && i < 8 && u < sizeof(In) - 24; ++i) {
+                    u += (size_t)std::snprintf(In + u, sizeof(In) - u, "%s%u:%ld", i ? " " : "",
+                        (unsigned)pMixBins->lpMixBinVolumePairs[i].dwMixBin, (long)pMixBins->lpMixBinVolumePairs[i].lVolume);
+                }
+                char Have[160]; u = 0; Have[0] = 0;
+                for (unsigned i = 0; i < Xb_VoiceProperties.dwMixBinCount && i < 8 && u < sizeof(Have) - 24; ++i) {
+                    u += (size_t)std::snprintf(Have + u, sizeof(Have) - u, "%s%u:%ld", i ? " " : "",
+                        (unsigned)Xb_VoiceProperties.MixBinVolumePairs[i].dwMixBin, (long)Xb_VoiceProperties.MixBinVolumePairs[i].lVolume);
+                }
+                printf("DSMIX: SetMixBinVolumes in={%s} table={%s} -> maxVolume=%ld voiceVol=%ld headroom=%ld => SetVolume(%ld + %ld) scored=%u fold=%s\n",
+                    In, Have, (long)maxVolume, (long)Xb_Voice->GetVolume(), (long)Xb_Voice->GetHeadroom(),
+                    (long)Xb_volume, (long)Xb_volumeMixBin,
+                    scored, (scored == 0) ? "sends-only->0" : "max-of-dry-bins");
+                fflush(stdout);
+            }
+        }
+
         hRet = HybridDirectSoundBuffer_SetVolume(pDSBuffer, Xb_volume, EmuFlags,
                                                     Xb_volumeMixBin, Xb_Voice);
     }
@@ -1403,15 +1551,42 @@ static inline HRESULT HybridDirectSoundBuffer_SetOutputBuffer(
 */
 //IDirectSoundStream
 //IDirectSoundBuffer
+// Host pan for a 3D-positioned voice, in the host's own units (DSBPAN_LEFT..DSBPAN_RIGHT,
+// i.e. -10000..10000), derived from the Xbox calculator's azimuth (Cxbxr3DVoice_PanMb).
+// Needs DSBCAPS_CTRLPAN on the host buffer, which GeneratePCMFormat adds to every buffer
+// that is not CTRL3D; on a CTRL3D host buffer SetPan fails with DSERR_CONTROLUNAVAIL and
+// that result is returned for the caller to report.
+static inline HRESULT HybridDirectSoundBuffer_SetPan3D(
+    LPDIRECTSOUNDBUFFER8 pDSBuffer,
+    LONG                lPanMb)
+{
+    if (pDSBuffer == nullptr) {
+        return DSERR_INVALIDPARAM;
+    }
+    if (lPanMb < DSBPAN_LEFT) {
+        lPanMb = DSBPAN_LEFT;
+    } else if (lPanMb > DSBPAN_RIGHT) {
+        lPanMb = DSBPAN_RIGHT;
+    }
+
+    return pDSBuffer->SetPan(lPanMb);
+}
+
+//IDirectSoundStream
+//IDirectSoundBuffer
 static inline HRESULT HybridDirectSoundBuffer_SetPitch(
     LPDIRECTSOUNDBUFFER8 pDSBuffer,
     LONG                lPitch,
-    xbox::CDirectSoundVoice* Xb_Voice)
+    xbox::CDirectSoundVoice* Xb_Voice,
+    LONG                lPitchDelta3D)
 {
 
     Xb_Voice->SetPitch(lPitch);
-    // Convert pitch back to frequency
-    uint32_t setFrequency = converter_pitch2freq(lPitch);
+    // Convert pitch back to frequency. The 3D doppler delta (1/4096 octave, the same
+    // unit as lPitch) is added for the host frequency only: the voice keeps the
+    // title's own pitch, which is what it reads back and what a host-buffer
+    // re-create restores.
+    uint32_t setFrequency = converter_pitch2freq(lPitch + lPitchDelta3D);
 
     RETURN_RESULT_CHECK(pDSBuffer->SetFrequency(setFrequency));
 }
@@ -1497,7 +1672,8 @@ static inline HRESULT HybridDirectSoundBuffer_SetVolume(
     LONG                    lVolume,
     DWORD                   dwEmuFlags,
     LONG                    Xb_volumeMixbin,
-    xbox::CDirectSoundVoice* Xb_Voice)
+    xbox::CDirectSoundVoice* Xb_Voice,
+    LONG                    lVolume3DMb)
 {
 
 #if 0 // TODO: Restore it once DSound work update comes up
@@ -1508,6 +1684,7 @@ static inline HRESULT HybridDirectSoundBuffer_SetVolume(
     Xb_Voice->SetVolume(lVolume);
     lVolume = Xb_Voice->GetVolume();
     lVolume += Xb_volumeMixbin;
+    lVolume += lVolume3DMb; // 3D attenuation (distance + cone + I3DL2 direct), <= 0, from Cxbxr3DVoice_VolumeOffsetMb
 
     HRESULT hRet = DSoundBufferUpdateHostVolume(pDSBuffer, dwEmuFlags, lVolume);
 

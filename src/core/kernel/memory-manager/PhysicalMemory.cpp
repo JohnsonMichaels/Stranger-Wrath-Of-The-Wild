@@ -728,12 +728,27 @@ void PhysicalMemory::DeallocatePT(size_t Size, VAddr addr)
 	}
 }
 
+// Exhaustion counters. This path already warned, but EmuLog is off in the shipped
+// configuration, so an out-of-memory condition was completely silent - and a level
+// load that fails to allocate looks exactly like a hang. Count it where it happens.
+unsigned g_MemStat_MapFailures = 0;
+unsigned g_MemStat_LastRequestPages = 0;
+unsigned g_MemStat_RetailPagesFree = 0;
+unsigned g_MemStat_DebugPagesFree = 0;
+
 bool PhysicalMemory::IsMappable(xbox::PFN_COUNT PagesRequested, bool bRetailRegion, bool bDebugRegion)
 {
 	bool ret = false;
 	if (bRetailRegion && m_PhysicalPagesAvailable >= PagesRequested) { ret = true; }
 	if (bDebugRegion && m_DebuggerPagesAvailable >= PagesRequested) { ret = true; }
-	if (!ret) { EmuLog(LOG_LEVEL::WARNING, "Out of physical memory!"); }
+
+	g_MemStat_RetailPagesFree = (unsigned)m_PhysicalPagesAvailable;
+	g_MemStat_DebugPagesFree = (unsigned)m_DebuggerPagesAvailable;
+	if (!ret) {
+		g_MemStat_MapFailures++;
+		g_MemStat_LastRequestPages = (unsigned)PagesRequested;
+		EmuLog(LOG_LEVEL::WARNING, "Out of physical memory!");
+	}
 
 	return ret;
 }

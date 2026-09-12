@@ -41,8 +41,6 @@
 
 // TODO: Tasks need to do for DirectSound HLE
 // * Missing IDirectSoundBuffer patch
-//   * IDirectSoundBuffer_Set3DVoiceData (new, undocument)
-//   * IDirectSoundBuffer_Use3DVoiceData (new, undocument)
 //   * IDirectSoundBuffer_QueryInterface (not require)
 //   * IDirectSoundBuffer_QueryInterfaceC (not require)
 
@@ -52,6 +50,90 @@
  */
 
 #include "DirectSoundInline.hpp"
+#include "DirectSound3DVoice.hpp"
+
+#include <cstdarg> // DS3D trace formatting
+#include <cstdio>
+
+// ******************************************************************
+// * 3D voice data -> host buffer (volume offset, pan, pitch delta)
+// ******************************************************************
+// XACT builds a positional effect out of two voices: a MIXIN "sound source" (the
+// parent, which never plays on the host) and the audible track voice, routed into
+// the parent with SetOutputBuffer. The native calculator's output is split by XACT
+// between them: the track keeps distance/cone/I3DL2/doppler (its own attenuation),
+// the parent keeps the panning bits. So a buffer's volume offset and pitch delta are
+// its own, and its pan is its parent's when it has one.
+
+// The parent recorded by SetOutputBuffer, or nullptr once that buffer is gone.
+static xbox::XbHybridDSBuffer* DSoundBuffer_3DOutputParent(xbox::XbHybridDSBuffer* pHybridThis)
+{
+    xbox::XbHybridDSBuffer* pParent = pHybridThis->emuDSBuffer->Xb_OutputParent;
+    if (pParent != nullptr
+        && std::find(g_pDSoundBufferCache.begin(), g_pDSoundBufferCache.end(), pParent) == g_pDSoundBufferCache.end()) {
+        // ~EmuDirectSoundBuffer unlinks the children of a released parent; this is
+        // the safety net for a parent that left the cache any other way.
+        pHybridThis->emuDSBuffer->Xb_OutputParent = nullptr;
+        pParent = nullptr;
+    }
+    return pParent;
+}
+
+// The pan this buffer should carry on the host: its parent's if it is routed, else its own.
+static LONG DSoundBuffer_3DPanMb(xbox::XbHybridDSBuffer* pHybridThis)
+{
+    xbox::XbHybridDSBuffer* pParent = DSoundBuffer_3DOutputParent(pHybridThis);
+    return Cxbxr3DVoice_PanMb((pParent != nullptr) ? pParent->emuDSBuffer->Xb_3D : pHybridThis->emuDSBuffer->Xb_3D);
+}
+
+// Re-apply the merged 3D state to the host buffer. The voice's own volume and pitch
+// are re-sent unchanged (the same round trip HybridDirectSoundBuffer_SetMixBinVolumes_8
+// makes for the volume) with the 3D terms on top.
+static void DSoundBuffer_Apply3DVoiceState(xbox::XbHybridDSBuffer* pHybridThis)
+{
+    xbox::EmuDirectSoundBuffer* pThis = pHybridThis->emuDSBuffer;
+    xbox::CDirectSoundVoice* Xb_Voice = pHybridThis->p_CDSVoice;
+    if (pThis->EmuDirectSoundBuffer8 == nullptr || Xb_Voice == nullptr) {
+        return;
+    }
+    int32_t Xb_volume = Xb_Voice->GetVolume() + Xb_Voice->GetHeadroom();
+    HybridDirectSoundBuffer_SetVolume(pThis->EmuDirectSoundBuffer8, Xb_volume, pThis->EmuFlags,
+                                      pThis->Xb_VolumeMixbin, Xb_Voice,
+                                      Cxbxr3DVoice_VolumeOffsetMb(pThis->Xb_3D));
+    HybridDirectSoundBuffer_SetPan3D(pThis->EmuDirectSoundBuffer8, DSoundBuffer_3DPanMb(pHybridThis));
+    HybridDirectSoundBuffer_SetPitch(pThis->EmuDirectSoundBuffer8, Xb_Voice->GetPitch(), Xb_Voice,
+                                     Cxbxr3DVoice_PitchDelta(pThis->Xb_3D));
+}
+
+// A parent's pan reaches the speakers through the children routed into it.
+static void DSoundBuffer_Propagate3DPan(xbox::XbHybridDSBuffer* pHybridParent)
+{
+    const LONG lPanMb = Cxbxr3DVoice_PanMb(pHybridParent->emuDSBuffer->Xb_3D);
+    for (xbox::XbHybridDSBuffer* pHybridChild : g_pDSoundBufferCache) {
+        xbox::EmuDirectSoundBuffer* pChild = pHybridChild->emuDSBuffer;
+        if (pChild->Xb_OutputParent == pHybridParent && pChild->EmuDirectSoundBuffer8 != nullptr) {
+            HybridDirectSoundBuffer_SetPan3D(pChild->EmuDirectSoundBuffer8, lPanMb);
+        }
+    }
+}
+
+// Bounded formatter for the DS3D trace lines.
+static void DS3D_Append(char* Buf, size_t Cap, size_t& Used, const char* Fmt, ...)
+{
+    if (Used >= Cap - 1) {
+        return;
+    }
+    va_list Args;
+    va_start(Args, Fmt);
+    int n = std::vsnprintf(Buf + Used, Cap - Used, Fmt, Args);
+    va_end(Args);
+    if (n > 0) {
+        Used += (size_t)n;
+        if (Used > Cap - 1) {
+            Used = Cap - 1;
+        }
+    }
+}
 
 // ******************************************************************
 // * patch: DirectSoundDoWork (buffer)
@@ -114,6 +196,14 @@ xbox::EmuDirectSoundBuffer::~EmuDirectSoundBuffer()
 {
     if (this->EmuDirectSound3DBuffer8 != nullptr) {
         this->EmuDirectSound3DBuffer8->Release();
+    }
+
+    // 3D: a voice still routed into this buffer (SetOutputBuffer) must not keep
+    // pointing at it.
+    for (XbHybridDSBuffer* pHybridChild : g_pDSoundBufferCache) {
+        if (pHybridChild->emuDSBuffer->Xb_OutputParent == this->pHybridThis) {
+            pHybridChild->emuDSBuffer->Xb_OutputParent = nullptr;
+        }
     }
 
     // remove cache entry
@@ -244,6 +334,27 @@ xbox::hresult_xt WINAPI xbox::EMUPATCH(DirectSoundCreateBuffer)
         else {
             if (pdsbd->dwFlags & DSBCAPS_CTRL3D) {
                 DSound3DBufferCreate(pEmuBuffer->EmuDirectSoundBuffer8, pEmuBuffer->EmuDirectSound3DBuffer8);
+
+                // Play positional sounds as plain 2D.
+                //
+                // Cxbx does not implement IDirectSound3DCalculator at all - there is
+                // no Calculate3D anywhere and no patch entry for it - so a 3D voice
+                // is created, filled with real audio and played successfully, but
+                // never receives a position or per-speaker volumes. It then sits at
+                // the default coordinates and attenuates to nothing. Measured in this
+                // title: moolah pickup and UI sounds (2D) play, while footsteps,
+                // attacks and impacts (3D) are silent, despite decoded peaks up to
+                // full scale and every Play returning DS_OK.
+                //
+                // DS3DMODE_DISABLE takes the buffer out of 3D processing entirely, so
+                // it mixes like an ordinary 2D sound at its own volume. Positional
+                // cues are lost - everything sounds centred, with no distance
+                // falloff - but an audible sound in the wrong place beats a correct
+                // one nobody can hear. Implementing real 3D would mean emulating
+                // listener orientation, distance rolloff and mixbin volumes.
+                if (pEmuBuffer->EmuDirectSound3DBuffer8 != nullptr) {
+                    pEmuBuffer->EmuDirectSound3DBuffer8->SetMode(DS3DMODE_DISABLE, DS3D_IMMEDIATE);
+                }
             }
 
             DSoundDebugMuteFlag(pEmuBuffer->X_BufferCacheSize, pEmuBuffer->EmuFlags);
@@ -557,6 +668,14 @@ xbox::hresult_xt WINAPI xbox::EMUPATCH(IDirectSoundBuffer_PauseEx)
 // ******************************************************************
 // * patch: IDirectSoundBuffer_Play
 // ******************************************************************
+// Where requested sound effects are lost. Effects ARE reaching Play (measured), so
+// they die at one of three places: the buffer update failing before Play is reached,
+// the host Play returning an error, or the host buffer holding no audio data.
+static unsigned g_DSoundStat_HostPlayCalled = 0;
+static unsigned g_DSoundStat_HostPlayFailed = 0;
+static unsigned g_DSoundStat_UpdateFailed = 0;
+static unsigned g_DSoundStat_SkippedSynch = 0;
+
 xbox::hresult_xt WINAPI xbox::EMUPATCH(IDirectSoundBuffer_Play)
 (
     XbHybridDSBuffer*       pHybridThis,
@@ -565,6 +684,23 @@ xbox::hresult_xt WINAPI xbox::EMUPATCH(IDirectSoundBuffer_Play)
     dword_xt                   dwFlags)
 {
     DSoundMutexGuardLock;
+
+    // Sound effects are silent while music plays. Music is streamed
+    // (CDirectSoundStream_*); effects are in-memory buffers, and THIS is the call
+    // that starts one. Counting it splits the problem cleanly in two:
+    //   0 calls  -> nothing ever asks for a sound effect, so the fault is upstream
+    //               in XACT / wave-bank loading, not in DirectSound at all
+    //   >0 calls -> effects are requested and the loss is inside playback here
+    // printf, because EmuLog is silent under LoggedModules = 0x0 and a shipped build
+    // routes stdout to diagnostics.txt.
+    {
+        static unsigned s_PlayCount = 0;
+        if (++s_PlayCount <= 20 || (s_PlayCount % 250) == 0) {
+            printf("DSOUND: IDirectSoundBuffer_Play #%u (buffer %p, flags 0x%08X)\n",
+                s_PlayCount, pHybridThis, (unsigned)dwFlags);
+            fflush(stdout);
+        }
+    }
 
 	LOG_FUNC_BEGIN
 		LOG_FUNC_ARG(pHybridThis)
@@ -604,6 +740,13 @@ xbox::hresult_xt WINAPI xbox::EMUPATCH(IDirectSoundBuffer_Play)
 
     DSoundBufferUpdate(pHybridThis, dwFlags, hRet);
 
+    // 3D: put the merged voice data (own attenuation, parent pan, doppler) back on the
+    // host object before it starts. UpdateTrackVolume runs SetMixBinVolumes right before
+    // this Play, and the mixbin fold re-sends the host volume without the 3D offset.
+    if (hRet == DS_OK && (pThis->Xb_3D.bUse || pThis->Xb_OutputParent != nullptr)) {
+        DSoundBuffer_Apply3DVoiceState(pHybridThis);
+    }
+
     if (hRet == DS_OK) {
         if (dwFlags & X_DSBPLAY_FROMSTART) {
             if (pThis->EmuDirectSoundBuffer8->SetCurrentPosition(0) != DS_OK) {
@@ -613,6 +756,67 @@ xbox::hresult_xt WINAPI xbox::EMUPATCH(IDirectSoundBuffer_Play)
         if ((pThis->EmuFlags & DSE_FLAG_SYNCHPLAYBACK_CONTROL) == 0) {
             hRet = pThis->EmuDirectSoundBuffer8->Play(0, 0, pThis->EmuPlayFlags);
 			pThis->EmuStreamingInfo.playRequested = true;
+            g_DSoundStat_HostPlayCalled++;
+            if (FAILED(hRet)) { g_DSoundStat_HostPlayFailed++; }
+        }
+        else {
+            g_DSoundStat_SkippedSynch++;
+        }
+    }
+    else {
+        g_DSoundStat_UpdateFailed++;
+    }
+
+    // Report the first few outcomes in full. A sound effect that is requested but
+    // never audible has to die at one of exactly three places: the buffer update
+    // failing before Play is reached, the host Play returning an error, or the host
+    // buffer having no audio data in it. Print enough to tell them apart.
+    {
+        static unsigned s_Reported = 0;
+        if (++s_Reported <= 12) {
+            printf("DSOUND:   -> hRet=0x%08X hostBuf=%p bytes=%u playFlags=0x%X emuFlags=0x%X\n",
+                (unsigned)hRet,
+                (void *)pThis->EmuDirectSoundBuffer8,
+                (unsigned)pThis->EmuBufferDesc.dwBufferBytes,
+                (unsigned)pThis->EmuPlayFlags,
+                (unsigned)pThis->EmuFlags);
+            fflush(stdout);
+        }
+    }
+
+    // DSPLAY silence detector. Every Play so far returned DS_OK with real audio in
+    // the buffer, so an inaudible sound is explained by the host object's state at
+    // the moment it starts - not by the call succeeding. Read that state BACK from
+    // the host rather than reporting what we believe we set. Xb_VolumeMixbin is the
+    // mixbin "dominant volume" SetVolume adds on every call; for a buffer whose
+    // table is the 3D default {6,8,7,9,10}, the fold that computes it ignores every
+    // bin >= 6 and yields DSBVOLUME_MIN.
+    {
+        static unsigned s_Detect = 0;
+        if (++s_Detect <= 200 && pThis->EmuDirectSoundBuffer8 != nullptr) {
+            LONG HostVolume = 0x7FFFFFFF, HostPan = 0x7FFFFFFF; DWORD HostFreq = 0, HostStatus = 0, Mode3D = 0xFFFFFFFF;
+            pThis->EmuDirectSoundBuffer8->GetVolume(&HostVolume);
+            pThis->EmuDirectSoundBuffer8->GetPan(&HostPan);
+            pThis->EmuDirectSoundBuffer8->GetFrequency(&HostFreq);
+            pThis->EmuDirectSoundBuffer8->GetStatus(&HostStatus);
+            if (pThis->EmuDirectSound3DBuffer8 != nullptr) {
+                pThis->EmuDirectSound3DBuffer8->GetMode(&Mode3D);
+            }
+            char Bins[160]; size_t Used = 0; Bins[0] = 0;
+            for (unsigned i = 0; i < pThis->Xb_VoiceProperties.dwMixBinCount && i < 8 && Used < sizeof(Bins) - 24; ++i) {
+                Used += (size_t)std::snprintf(Bins + Used, sizeof(Bins) - Used, "%s%u:%ld", i ? " " : "",
+                    (unsigned)pThis->Xb_VoiceProperties.MixBinVolumePairs[i].dwMixBin,
+                    (long)pThis->Xb_VoiceProperties.MixBinVolumePairs[i].lVolume);
+            }
+            printf("DSPLAY: buffer %p xbFlags=0x%08X ctrl3d=%d hostFlags=0x%08X volMixbin=%ld hostVol=%ld hostFreq=%u status=0x%X mode3d=%u mixbins[%u]={%s} hostPan=%ld off3d=%ld pan3d=%ld pitch3d=%ld use3d=%d have3d=0x%02X parent=%p\n",
+                (void *)pHybridThis, (unsigned)pThis->Xb_Flags, (int)((pThis->Xb_Flags & 0x10) != 0),
+                (unsigned)pThis->EmuBufferDesc.dwFlags, (long)pThis->Xb_VolumeMixbin, (long)HostVolume,
+                (unsigned)HostFreq, (unsigned)HostStatus, (unsigned)Mode3D,
+                (unsigned)pThis->Xb_VoiceProperties.dwMixBinCount, Bins,
+                (long)HostPan, (long)Cxbxr3DVoice_VolumeOffsetMb(pThis->Xb_3D), (long)DSoundBuffer_3DPanMb(pHybridThis),
+                (long)Cxbxr3DVoice_PitchDelta(pThis->Xb_3D), (int)pThis->Xb_3D.bUse, (unsigned)pThis->Xb_3D.dwHave,
+                (void *)pThis->Xb_OutputParent);
+            fflush(stdout);
         }
     }
 
@@ -1179,6 +1383,11 @@ xbox::hresult_xt WINAPI xbox::EMUPATCH(IDirectSoundBuffer_SetMixBinVolumes_12)
     HRESULT hRet = HybridDirectSoundBuffer_SetMixBinVolumes_12(pThis->EmuDirectSoundBuffer8, dwMixBinMask, alVolumes, pThis->Xb_VoiceProperties,
                                                               pThis->EmuFlags, pThis->Xb_VolumeMixbin, pHybridThis->p_CDSVoice);
 
+    // The fold re-sent the host volume without the 3D offset; put it back.
+    if (pThis->Xb_3D.bUse || pThis->Xb_OutputParent != nullptr) {
+        DSoundBuffer_Apply3DVoiceState(pHybridThis);
+    }
+
     return hRet;
 }
 
@@ -1201,6 +1410,11 @@ xbox::hresult_xt WINAPI xbox::EMUPATCH(IDirectSoundBuffer_SetMixBinVolumes_8)
     EmuDirectSoundBuffer* pThis = pHybridThis->emuDSBuffer;
     HRESULT hRet = HybridDirectSoundBuffer_SetMixBinVolumes_8(pThis->EmuDirectSoundBuffer8, pMixBins, pThis->Xb_VoiceProperties,
                                                               pThis->EmuFlags, pThis->Xb_VolumeMixbin, pHybridThis->p_CDSVoice);
+
+    // The fold re-sent the host volume without the 3D offset; put it back.
+    if (pThis->Xb_3D.bUse || pThis->Xb_OutputParent != nullptr) {
+        DSoundBuffer_Apply3DVoiceState(pHybridThis);
+    }
 
     return hRet;
 }
@@ -1293,7 +1507,34 @@ xbox::hresult_xt WINAPI xbox::EMUPATCH(IDirectSoundBuffer_SetOutputBuffer)
     // Test case: MultiPass sample
     // Best to emulate this LLE instead of HLE.
 
-    LOG_NOT_SUPPORTED();
+    LOG_NOT_SUPPORTED(); // the host-side routing; the bookkeeping below is what this title needs from it
+
+    // XACT routes every track voice into its "sound source" - a MIXIN submix that never
+    // plays on the host - with this call, and that submix is where the calculator's
+    // panning data lands (Set3DVoiceData). Remember the parent and take its pan now;
+    // a NULL parent un-routes. Only a buffer we created is ever dereferenced.
+    EmuDirectSoundBuffer* pThis = pHybridThis->emuDSBuffer;
+    XbHybridDSBuffer* pOldParent = pThis->Xb_OutputParent;
+    XbHybridDSBuffer* pNewParent = pOutputBuffer;
+    if (pNewParent != nullptr
+        && std::find(g_pDSoundBufferCache.begin(), g_pDSoundBufferCache.end(), pNewParent) == g_pDSoundBufferCache.end()) {
+        pNewParent = nullptr;
+    }
+    pThis->Xb_OutputParent = pNewParent;
+    if ((pNewParent != nullptr || pOldParent != nullptr) && pThis->EmuDirectSoundBuffer8 != nullptr) {
+        HybridDirectSoundBuffer_SetPan3D(pThis->EmuDirectSoundBuffer8, DSoundBuffer_3DPanMb(pHybridThis));
+    }
+
+    { // DS3D trace
+        static unsigned s_Seen = 0;
+        if (++s_Seen <= 40) {
+            printf("DS3D: SetOutputBuffer buffer %p parent %p%s -> pan=%ld\n",
+                (void *)pHybridThis, (void *)pOutputBuffer,
+                (pOutputBuffer != nullptr && pNewParent == nullptr) ? " (not a cached buffer, ignored)" : "",
+                (long)DSoundBuffer_3DPanMb(pHybridThis));
+            fflush(stdout);
+        }
+    }
 
     return S_OK;
 }
@@ -1315,7 +1556,8 @@ xbox::hresult_xt WINAPI xbox::EMUPATCH(IDirectSoundBuffer_SetPitch)
 
     EmuDirectSoundBuffer* pThis = pHybridThis->emuDSBuffer;
     HRESULT hRet = HybridDirectSoundBuffer_SetPitch(pThis->EmuDirectSoundBuffer8, lPitch,
-                                                    pHybridThis->p_CDSVoice);
+                                                    pHybridThis->p_CDSVoice,
+                                                    Cxbxr3DVoice_PitchDelta(pThis->Xb_3D));
 
     return hRet;
 }
@@ -1486,7 +1728,8 @@ xbox::hresult_xt WINAPI xbox::EMUPATCH(IDirectSoundBuffer_SetVolume)
 
     EmuDirectSoundBuffer* pThis = pHybridThis->emuDSBuffer;
     HRESULT hRet = HybridDirectSoundBuffer_SetVolume(pThis->EmuDirectSoundBuffer8, lVolume, pThis->EmuFlags,
-                                                     pThis->Xb_VolumeMixbin, pHybridThis->p_CDSVoice);
+                                                     pThis->Xb_VolumeMixbin, pHybridThis->p_CDSVoice,
+                                                     Cxbxr3DVoice_VolumeOffsetMb(pThis->Xb_3D));
 
     return hRet;
 }
@@ -1629,9 +1872,44 @@ xbox::hresult_xt WINAPI xbox::EMUPATCH(IDirectSoundBuffer_Set3DVoiceData)
         LOG_FUNC_ARG(a2)
         LOG_FUNC_END;
 
-    LOG_UNIMPLEMENTED();
+    // XACT hands us the native calculator's output (X_DS3DCALCVOICEDATA, 0x38 bytes),
+    // already masked per voice kind: 0xDC on the MIXIN parent (panning), 0x33 on the
+    // audible track voice (attenuation + doppler). Merge the flagged fields and put the
+    // result on the host: own volume offset / pitch delta here, pan on the children.
+    EmuDirectSoundBuffer* pThis = pHybridThis->emuDSBuffer;
+    const X_DS3DCALCVOICEDATA* pData = (const X_DS3DCALCVOICEDATA*)(uintptr_t)a2;
+    const bool bReadable = (pData != nullptr) && !IsBadReadPtr(pData, sizeof(X_DS3DCALCVOICEDATA));
+    if (bReadable) {
+        Cxbxr3DVoice_Merge(pThis->Xb_3D, pData);
+    }
+    DSoundBuffer_Apply3DVoiceState(pHybridThis);
+    DSoundBuffer_Propagate3DPan(pHybridThis);
 
-    RETURN(X_STATUS_SUCCESS);
+    // DS3D trace: the proof that the native calculator produces data, and what the
+    // host makes of it. printf because EmuLog is off in this build.
+    {
+        static unsigned s_Seen = 0;
+        if (++s_Seen <= 60) {
+            char Fields[256]; size_t Used = 0; Fields[0] = 0;
+            const unsigned mask = bReadable ? (unsigned)(pData->dwChangeMask & 0xFF) : 0u;
+            if (mask & X_DS3DVOICEDATA_DISTANCE)  { DS3D_Append(Fields, sizeof(Fields), Used, " dist=%ld", (long)pData->lDistanceVolume); }
+            if (mask & X_DS3DVOICEDATA_CONE)      { DS3D_Append(Fields, sizeof(Fields), Used, " cone=%ld", (long)pData->lConeVolume); }
+            if (mask & X_DS3DVOICEDATA_FRONTREAR) { DS3D_Append(Fields, sizeof(Fields), Used, " front=%ld rear=%ld", (long)pData->lFrontVolume, (long)pData->lRearVolume); }
+            if (mask & X_DS3DVOICEDATA_CENTER)    { DS3D_Append(Fields, sizeof(Fields), Used, " lr=%ld ctr=%ld", (long)pData->lLeftRightVolume, (long)pData->lCenterVolume); }
+            if (mask & X_DS3DVOICEDATA_I3DL2)     { DS3D_Append(Fields, sizeof(Fields), Used, " direct=%ld reverb=%ld", (long)pData->lDirectVolume, (long)pData->lReverbVolume); }
+            if (mask & X_DS3DVOICEDATA_DOPPLER)   { DS3D_Append(Fields, sizeof(Fields), Used, " doppler=%ld", (long)pData->lDopplerPitch); }
+            if (mask & X_DS3DVOICEDATA_FIRFILTER) { DS3D_Append(Fields, sizeof(Fields), Used, " az=%.1f el=%.1f", (double)pData->flFIRFilterAzimuth, (double)pData->flFIRFilterElevation); }
+            if (mask & X_DS3DVOICEDATA_IIRFILTER) { DS3D_Append(Fields, sizeof(Fields), Used, " iir=%08X/%08X", (unsigned)pData->dwIIRFilterDirect, (unsigned)pData->dwIIRFilterReverb); }
+            printf("DS3D: Set3DVoiceData buffer %p data %p%s mask=0x%02X {%s } have=0x%02X use=%d parent=%p -> offset=%ld pan=%ld pitch=%ld\n",
+                (void *)pHybridThis, (void *)pData, bReadable ? "" : " (unreadable)", mask, Fields,
+                (unsigned)pThis->Xb_3D.dwHave, (int)pThis->Xb_3D.bUse, (void *)pThis->Xb_OutputParent,
+                (long)Cxbxr3DVoice_VolumeOffsetMb(pThis->Xb_3D), (long)DSoundBuffer_3DPanMb(pHybridThis),
+                (long)Cxbxr3DVoice_PitchDelta(pThis->Xb_3D));
+            fflush(stdout);
+        }
+    }
+
+    return DS_OK;
 }
 
 // ******************************************************************
@@ -1649,7 +1927,28 @@ xbox::hresult_xt WINAPI xbox::EMUPATCH(IDirectSoundBuffer_Use3DVoiceData)
 		LOG_FUNC_ARG(pUnknown)
 		LOG_FUNC_END;
 
-    LOG_NOT_SUPPORTED();
+    // The second argument is a BOOL (DS3D_CALCULATOR_CONTRACT.md 1.4): XACT passes
+    // "this voice or the voice it is routed into is 3D". On the Xbox it gates every
+    // 3D term (settings flag 0x01000000); here it gates the three host terms likewise.
+    EmuDirectSoundBuffer* pThis = pHybridThis->emuDSBuffer;
+    const bool bWasUse = pThis->Xb_3D.bUse;
+    pThis->Xb_3D.bUse = (pUnknown != nullptr);
+    if (pThis->Xb_3D.bUse || bWasUse || pThis->Xb_OutputParent != nullptr) {
+        DSoundBuffer_Apply3DVoiceState(pHybridThis);
+        DSoundBuffer_Propagate3DPan(pHybridThis);
+    }
+
+    { // DS3D trace (see Set3DVoiceData)
+        static unsigned s_Seen = 0;
+        if (++s_Seen <= 40) {
+            printf("DS3D: Use3DVoiceData buffer %p use=%d parent=%p -> offset=%ld pan=%ld pitch=%ld\n",
+                (void *)pHybridThis, (int)pThis->Xb_3D.bUse, (void *)pThis->Xb_OutputParent,
+                (long)Cxbxr3DVoice_VolumeOffsetMb(pThis->Xb_3D), (long)DSoundBuffer_3DPanMb(pHybridThis),
+                (long)Cxbxr3DVoice_PitchDelta(pThis->Xb_3D));
+            fflush(stdout);
+        }
+    }
 
     return DS_OK;
 }
+

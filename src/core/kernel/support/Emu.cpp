@@ -183,17 +183,65 @@ bool EmuExceptionBreakpointAsk(LPEXCEPTION_POINTERS e)
 #endif
 }
 
+// Describes a code address as "module.dll+0x1234".
+//
+// The raw EIP in a crash report is close to useless on its own: every run gets
+// different module bases from ASLR, so an address noted from one session cannot
+// be looked up in the next. Reporting module + offset makes the fault stable
+// across runs and directly usable against a map/PDB.
+static void EmuDescribeCodeAddress(void *pAddress, char *pBuffer, size_t BufferSize)
+{
+	HMODULE hModule = nullptr;
+	if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			(LPCSTR)pAddress, &hModule) && hModule != nullptr) {
+		char szPath[MAX_PATH] = { 0 };
+		if (GetModuleFileNameA(hModule, szPath, MAX_PATH) > 0) {
+			const char *pName = strrchr(szPath, '\\');
+			pName = (pName != nullptr) ? pName + 1 : szPath;
+			sprintf_s(pBuffer, BufferSize, "%s+0x%X (module base 0x%08X)",
+				pName,
+				(unsigned)((uintptr_t)pAddress - (uintptr_t)hModule),
+				(unsigned)(uintptr_t)hModule);
+			return;
+		}
+	}
+
+	sprintf_s(pBuffer, BufferSize, "no module - guest code or freed memory");
+}
+
 bool EmuExceptionNonBreakpointUnhandledShow(LPEXCEPTION_POINTERS e)
 {
 	EmuExceptionPrintDebugInformation(e, /*IsBreakpointException=*/false);
 
+	char szWhere[MAX_PATH + 64];
+	EmuDescribeCodeAddress((void *)e->ContextRecord->Eip, szWhere, sizeof(szWhere));
+
+	// For an access violation the record also carries what was touched and how,
+	// which separates "wrote past the end of a buffer" from "followed a null or
+	// stale pointer" without needing a debugger attached.
+	char szAccess[160] = { 0 };
+	if (e->ExceptionRecord->ExceptionCode == STATUS_ACCESS_VIOLATION
+	 && e->ExceptionRecord->NumberParameters >= 2) {
+		const ULONG_PTR Operation = e->ExceptionRecord->ExceptionInformation[0];
+		const ULONG_PTR Target    = e->ExceptionRecord->ExceptionInformation[1];
+		sprintf_s(szAccess, sizeof(szAccess), "\n  Attempted to %s address 0x%08X.",
+			(Operation == 0) ? "READ" : ((Operation == 1) ? "WRITE" : "EXECUTE"),
+			(unsigned)Target);
+	}
+
+	printf("[0x%.4X] MAIN: UNHANDLED EXCEPTION 0x%.8X at 0x%.08X = %s%s\n",
+		GetCurrentThreadId(), e->ExceptionRecord->ExceptionCode,
+		e->ContextRecord->Eip, szWhere, szAccess);
+	fflush(stdout);
+
 	auto result = PopupFatalEx(nullptr, PopupButtons::AbortRetryIgnore, PopupReturn::Abort,
 		"  The running xbe has encountered an unhandled exception (Code := 0x%.8X) at address 0x%.08X.\n"
+		"  In: %s%s\n"
 		"\n"
 		"  Press \"Abort\" to terminate emulation.\n"
 		"  Press \"Retry\" to debug.\n"
 		"  Press \"Ignore\" to attempt to continue emulation.",
-		e->ExceptionRecord->ExceptionCode, e->ContextRecord->Eip);
+		e->ExceptionRecord->ExceptionCode, e->ContextRecord->Eip, szWhere, szAccess);
 
 	if (result == PopupReturn::Abort) {
 		EmuExceptionExitProcess();

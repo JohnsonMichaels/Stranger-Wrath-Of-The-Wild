@@ -42,6 +42,7 @@
 //   * IDirectSound3DCalculator_GetMixBinVolumes
 //   * IDirectSound3DCalculator_GetPanData
 
+#include <cstdio>
 #include "DirectSoundInline.hpp"
 
 /* ------------- Sorted relative functions begin ------------------*/
@@ -63,6 +64,12 @@ xbox::void_xt WINAPI xbox::EMUPATCH(CDirectSound3DCalculator_Calculate3D)
         LOG_FUNC_END;
 
     LOG_UNIMPLEMENTED();
+
+    // Intentionally unreachable: this patch is no longer registered in Patches.cpp.
+    // The Xbox's own light-HRTF calculator is pure CPU code inside the XBE and runs
+    // natively; its output reaches the emulator through IDirectSoundBuffer_Set3DVoiceData
+    // (DirectSoundBuffer.cpp / DirectSound3DVoice.cpp). The body is kept only so this
+    // file, which is in the CMake source list, still compiles.
 }
 
 // ******************************************************************
@@ -88,4 +95,7 @@ xbox::void_xt WINAPI xbox::EMUPATCH(CDirectSound3DCalculator_GetVoiceData)
         LOG_FUNC_END;
 
     LOG_UNIMPLEMENTED();
+
+    // Intentionally unreachable: not registered in Patches.cpp any more (see Calculate3D
+    // above). The native GetVoiceData fills XACT's _DS3DCALCVOICEDATA itself.
 }

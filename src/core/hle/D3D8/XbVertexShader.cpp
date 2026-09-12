@@ -53,6 +53,7 @@
 #include <bitset>
 #include <filesystem>
 
+#include <set> // vertex declaration census
 #include "nv2a_vsh_emulator.h"
 
 // External symbols :
@@ -65,6 +66,25 @@ extern XboxRenderStateConverter XboxRenderStates; // Declared in Direct3D9.cpp
  xbox::X_VERTEXATTRIBUTEFORMAT g_Xbox_SetVertexShaderInput_Attributes = { 0 }; // Read by GetXboxVertexAttributes when g_Xbox_SetVertexShaderInput_Count > 0
 
 VertexShaderMode g_Xbox_VertexShaderMode = VertexShaderMode::FixedFunction;
+
+// The mode above decides whether host draws run through the title's vertex shader
+// program or through D3D9 fixed-function transforms. On this LTCG build it never
+// leaves FixedFunction, which blanks all 3D while pre-transformed 2D UI still
+// draws. CxbxImpl_SelectVertexShader sets ShaderProgram unconditionally, so the
+// mode being stuck proves that function is never reached - these counters say
+// which link of SetVertexShader -> LoadVertexShader -> SelectVertexShader breaks.
+unsigned g_VSStat_SetVertexShader = 0;
+unsigned g_VSStat_SetVertexShader_ProgramBranch = 0;
+unsigned g_VSStat_LoadVertexShader = 0;
+unsigned g_VSStat_SelectVertexShader = 0;
+unsigned g_VSStat_SelectVertexShader_WithHandle = 0;
+// [0]=FixedFunction [1]=Passthrough [2]=ShaderProgram, as decided from LIVE device
+// state rather than from our patch-written shadow variables.
+unsigned g_VSStat_EffectiveMode[4] = { 0, 0, 0, 0 };
+unsigned g_VSStat_ModeCorrected = 0;
+unsigned g_VSStat_StartAddressCorrected = 0;
+unsigned g_VSStat_LastLiveStartAddress = 0;
+unsigned g_VSStat_LastShadowStartAddress = 0;
 bool g_UseFixedFunctionVertexShader = true;
 
                 xbox::dword_xt g_Xbox_VertexShader_Handle = 0;
@@ -86,6 +106,27 @@ static xbox::X_D3DVertexShader g_Xbox_VertexShader_ForFVF = {};
 static uint32_t                g_X_VERTEXSHADER_FLAG_PROGRAM; // X_VERTEXSHADER_FLAG_PROGRAM flag varies per XDK, so it is set on runtime
 static uint32_t                g_X_VERTEXSHADER_FLAG_VALID_MASK; // For a test case
 static std::array<float, X_D3DVS_CONSTREG_COUNT * 4> g_EmuD3DVertexShaderConstants = {};
+// Vertex shader constant write census - see CxbxImpl_SetVertexShaderConstant.
+unsigned g_VSConst_Calls = 0;
+unsigned g_VSConst_MinReg = 0xFFFFFFFFu;
+unsigned g_VSConst_MaxReg = 0;
+
+// How many of the 192 constant registers currently hold a non-zero value, and the
+// highest one that does. A skinning setup writes many registers; if this stays
+// small while characters are invisible, the bone matrices are simply not there.
+void CxbxGetVertexShaderConstantOccupancy(unsigned *pNonZero, unsigned *pHighest)
+{
+	unsigned NonZero = 0, Highest = 0;
+	for (int r = 0; r < X_D3DVS_CONSTREG_COUNT; r++) {
+		const float *c = &g_EmuD3DVertexShaderConstants[(size_t)r * 4];
+		if (c[0] != 0.0f || c[1] != 0.0f || c[2] != 0.0f || c[3] != 0.0f) {
+			NonZero++;
+			Highest = (unsigned)r;
+		}
+	}
+	*pNonZero = NonZero;
+	*pHighest = Highest;
+}
 static std::array<bool, X_D3DVS_CONSTREG_COUNT> g_EmuD3DVertexShaderConstantsDirty = {};
 
 float* CxbxGetVertexShaderConstantFloat4Ptr(unsigned const_index)
@@ -959,6 +1000,33 @@ private:
 		pCurrentVertexShaderStreamElementInfo->HostDataType = HostVertexElementDataType;
 		pCurrentVertexShaderStreamElementInfo->HostByteSize = HostVertexElementByteSize;
 
+		// Census of every distinct (register, Xbox type, host type) the title
+		// declares, printed once each.
+		//
+		// Why: characters render as eyeballs only - rigid meshes appear, SKINNED
+		// meshes do not, and droppedUnboundStream=0 proves their draws are being
+		// submitted rather than discarded, so the geometry is being transformed
+		// into nothing. This engine packs two-bone skinning into vertex register 1
+		// (X_D3DVSDE_BLENDWEIGHT): bone INDICES in .xy and weights in .zw. Bone
+		// indices must survive as raw values; if a packed-byte type is mapped to a
+		// _N (normalized) host type, D3D divides them by 255 and every vertex
+		// samples bone 0 with a fractional weight - which collapses the mesh.
+		// printf, not EmuLog: EmuLog is silent under LoggedModules = 0x0.
+		{
+			const uint32_t CensusKey = ((uint32_t)VertexRegister << 24)
+			                         | ((uint32_t)(XboxVertexElementDataType & 0xFFF) << 12)
+			                         | ((uint32_t)HostVertexElementDataType & 0xFFF);
+			static std::set<uint32_t> s_SeenDeclarations;
+			if (s_SeenDeclarations.insert(CensusKey).second) {
+				printf("VTXDECL: register %2u  xboxType 0x%02X  hostType %2u  xboxBytes %u  hostBytes %u%s\n",
+					(unsigned)VertexRegister, (unsigned)XboxVertexElementDataType,
+					(unsigned)HostVertexElementDataType,
+					(unsigned)XboxVertexElementByteSize, (unsigned)HostVertexElementByteSize,
+					(VertexRegister == xbox::X_D3DVSDE_BLENDWEIGHT) ? "   <-- SKINNING (indices .xy / weights .zw)" : "");
+				fflush(stdout);
+			}
+		}
+
 		// Convert to host vertex element
 		pCurrentHostVertexElement->Stream = pCurrentVertexShaderStreamInfo->XboxStreamIndex; // Use Xbox stream index on host
 		// FIXME Don't assume vertex elements are contiguous!
@@ -1206,6 +1274,23 @@ void CxbxUpdateHostVertexShader()
 
 	LOG_INIT; // Allows use of DEBUG_D3DRESULT
 
+	// NEGATIVE RESULT - do not retry this. Deriving the mode from the live device
+	// shader's Flags (ShaderProgram when X_VERTEXSHADER_FLAG_PROGRAM is set, else
+	// FixedFunction) looks right by symmetry with the shader-pointer fix, and the
+	// device field really is authoritative for WHICH shader is bound. But it is not
+	// authoritative for which host PIPELINE to run: doing this resolved every draw
+	// to FixedFunction (FF=18187 PROG=0, disagreeing with the shadow variable 18185
+	// times) and rendered the entire menu black - the SWF/Flash UI, which is the one
+	// thing that was drawing correctly, genuinely does use a vertex program.
+	// g_Xbox_VertexShaderMode is the correct source here. Kept as a counter only.
+	if (xbox::X_D3DVertexShader *pLiveShader = CxbxrGetXboxCurrentVertexShader()) {
+		const bool bLiveSaysProgram = (pLiveShader->Flags & g_X_VERTEXSHADER_FLAG_PROGRAM) != 0;
+		if (bLiveSaysProgram != (g_Xbox_VertexShaderMode == VertexShaderMode::ShaderProgram)) {
+			g_VSStat_ModeCorrected++;
+		}
+	}
+	g_VSStat_EffectiveMode[(unsigned)g_Xbox_VertexShaderMode & 3]++;
+
 	IDirect3DVertexShader* pNewShader = nullptr;
 	if (g_Xbox_VertexShaderMode == VertexShaderMode::FixedFunction) {
 		pNewShader = fixedFunctionShader;
@@ -1214,7 +1299,22 @@ void CxbxUpdateHostVertexShader()
 		pNewShader = passthroughShader;
 	}
 	else {
-		auto pTokens = GetCxbxVertexShaderSlotPtr(g_Xbox_VertexShader_FunctionSlots_StartAddress);
+		// Prefer the title's own device field over our shadow variable. This title
+		// re-points the vertex program through D3DDevice_SelectVertexShaderDirect's
+		// NULL-declaration branch, which no Cxbx patch can see, so the shadow
+		// variable is stale for every world draw. See CxbxrGetXboxVertexShaderStartAddress.
+		xbox::dword_xt StartAddress = g_Xbox_VertexShader_FunctionSlots_StartAddress;
+		xbox::dword_xt LiveStartAddress;
+		if (CxbxrGetXboxVertexShaderStartAddress(&LiveStartAddress)) {
+			if (LiveStartAddress != StartAddress) {
+				g_VSStat_StartAddressCorrected++;
+			}
+			StartAddress = LiveStartAddress;
+			g_VSStat_LastLiveStartAddress = LiveStartAddress;
+		}
+		g_VSStat_LastShadowStartAddress = g_Xbox_VertexShader_FunctionSlots_StartAddress;
+
+		auto pTokens = GetCxbxVertexShaderSlotPtr(StartAddress);
 		assert(pTokens);
 		// Create a vertex shader from the tokens
 		DWORD shaderSize;
@@ -1456,9 +1556,11 @@ void CxbxImpl_SelectVertexShader(DWORD Handle, DWORD Address)
 	// Either way, the given address slot is selected as the start of the current vertex shader program
 	g_Xbox_VertexShader_FunctionSlots_StartAddress = Address;
 
+	g_VSStat_SelectVertexShader++;
 	g_Xbox_VertexShaderMode = VertexShaderMode::ShaderProgram;
 
 	if (Handle) {
+		g_VSStat_SelectVertexShader_WithHandle++;
 		if (!VshHandleIsVertexShader(Handle))
 			LOG_TEST_CASE("Non-zero handle must be a VertexShader!");
 
@@ -1489,6 +1591,8 @@ void CxbxImpl_LoadVertexShader(DWORD Handle, DWORD Address)
 	// Handle is always address of an X_D3DVertexShader struct, thus always or-ed with 1 (X_D3DFVF_RESERVED0)
 	// Address is the slot (offset) from which the program must be written onwards (as whole DWORDS)
 	// D3DDevice_LoadVertexShader pushes the program contained in the Xbox VertexShader struct to the NV2A
+
+	g_VSStat_LoadVertexShader++;
 
 	xbox::X_D3DVertexShader* pXboxVertexShader = VshHandleToXboxVertexShader(Handle);
 
@@ -1582,6 +1686,8 @@ void CxbxImpl_SetVertexShader(DWORD Handle)
 
 	HRESULT hRet = D3D_OK;
 
+	g_VSStat_SetVertexShader++;
+
 	xbox::X_D3DVertexShader* pXboxVertexShader = CxbxGetXboxVertexShaderForHandle(Handle);
 
 	if ((pXboxVertexShader->Flags & g_X_VERTEXSHADER_FLAG_VALID_MASK) != pXboxVertexShader->Flags) {
@@ -1589,6 +1695,7 @@ void CxbxImpl_SetVertexShader(DWORD Handle)
 	}
 
 	if (pXboxVertexShader->Flags & g_X_VERTEXSHADER_FLAG_PROGRAM) { // Global variable set from CxbxVertexShaderSetFlags
+		g_VSStat_SetVertexShader_ProgramBranch++;
 #if 0 // Since the D3DDevice_SetVertexShader patch already called it's trampoline, these calls have already been executed :
 		CxbxImpl_LoadVertexShader(Handle, 0);
 		CxbxImpl_SelectVertexShader(Handle, 0);
@@ -1674,6 +1781,15 @@ void CxbxImpl_SetVertexShaderConstant(INT Register, PVOID pConstantData, DWORD C
 	if (Register < 0) LOG_TEST_CASE("Register < 0");
 	if (Register + ConstantCount > X_D3DVS_CONSTREG_COUNT) LOG_TEST_CASE("Register + ConstantCount > X_D3DVS_CONSTREG_COUNT");
 
+	// Track what the title actually writes. Skinned characters are invisible while
+	// rigid geometry draws, and their vertex data has been verified correct, so the
+	// suspicion is that the bone matrices never arrive - two vec4 program locals per
+	// bone. If whole register ranges are never touched here, the title is setting
+	// them through a path we do not observe, exactly like SelectVertexShaderDirect.
+	g_VSConst_Calls++;
+	if ((unsigned)Register < g_VSConst_MinReg) g_VSConst_MinReg = (unsigned)Register;
+	if ((unsigned)(Register + ConstantCount) > g_VSConst_MaxReg) g_VSConst_MaxReg = (unsigned)(Register + ConstantCount);
+
 	// Maintain Xbox vertex shader constants in EmuD3D instead of mirroring through NV2A state.
 	float* constant_floats = CxbxGetVertexShaderConstantFloat4Ptr(Register);
 	memcpy(constant_floats, pConstantData, ConstantCount * sizeof(float) * 4);
@@ -1739,3 +1855,4 @@ void CxbxrImpl_RunVertexStateShader(DWORD Address, CONST FLOAT *pData)
 
 	nv2a_vsh_program_destroy(&program); // Note: program.steps will be free'ed
 }
+

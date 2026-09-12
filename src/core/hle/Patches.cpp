@@ -238,8 +238,7 @@ std::map<const std::string, const xbox_patch_t> g_PatchTable = {
 	PATCH_ENTRY("Lock3DSurface_16__LTCG_eax4", xbox::EMUPATCH(Lock3DSurface_16__LTCG_eax4), PATCH_HLE_D3D),
 
 	// DSOUND
-	PATCH_ENTRY("CDirectSound3DCalculator_Calculate3D", xbox::EMUPATCH(CDirectSound3DCalculator_Calculate3D), PATCH_HLE_DSOUND),
-	PATCH_ENTRY("CDirectSound3DCalculator_GetVoiceData", xbox::EMUPATCH(CDirectSound3DCalculator_GetVoiceData), PATCH_HLE_DSOUND),
+	// CDirectSound3DCalculator_Calculate3D / _GetVoiceData deliberately NOT patched: the Xbox's own light-HRTF calculator is pure CPU code and runs natively; the LOG_UNIMPLEMENTED stubs kept any voice data from ever being produced.
 	PATCH_ENTRY("CDirectSoundStream_AddRef", xbox::EMUPATCH(CDirectSoundStream_AddRef), PATCH_HLE_DSOUND),
 	PATCH_ENTRY("CDirectSoundStream_Discontinuity", xbox::EMUPATCH(CDirectSoundStream_Discontinuity), PATCH_HLE_DSOUND),
 	PATCH_ENTRY("CDirectSoundStream_Flush", xbox::EMUPATCH(CDirectSoundStream_Flush), PATCH_HLE_DSOUND),
@@ -289,7 +288,7 @@ std::map<const std::string, const xbox_patch_t> g_PatchTable = {
 	PATCH_ENTRY("DirectSoundGetSampleTime", xbox::EMUPATCH(DirectSoundGetSampleTime), PATCH_HLE_DSOUND),
 	PATCH_ENTRY("DirectSoundUseFullHRTF", xbox::EMUPATCH(DirectSoundUseFullHRTF), PATCH_HLE_DSOUND),
 	PATCH_ENTRY("DirectSoundUseFullHRTF4Channel", xbox::EMUPATCH(DirectSoundUseFullHRTF4Channel), PATCH_HLE_DSOUND),
-	PATCH_ENTRY("DirectSoundUseLightHRTF", xbox::EMUPATCH(DirectSoundUseLightHRTF), PATCH_HLE_DSOUND),
+	// DirectSoundUseLightHRTF deliberately NOT patched: it installs the native calculator's algorithm table (pure CPU code); the LOG_IGNORED stub left that table NULL, so Calculate3D/GetVoiceData could never run.
 	PATCH_ENTRY("DirectSoundUseLightHRTF4Channel", xbox::EMUPATCH(DirectSoundUseLightHRTF4Channel), PATCH_HLE_DSOUND),
 	PATCH_ENTRY("IDirectSoundBuffer_AddRef", xbox::EMUPATCH(IDirectSoundBuffer_AddRef), PATCH_HLE_DSOUND),
 	PATCH_ENTRY("IDirectSoundBuffer_GetCurrentPosition", xbox::EMUPATCH(IDirectSoundBuffer_GetCurrentPosition), PATCH_HLE_DSOUND),
@@ -496,6 +495,51 @@ inline bool TitleRequiresUnpatchedFibers()
 inline void EmuInstallPatch(const std::string FunctionName, const xbox::addr_xt FunctionAddr)
 {
 	auto it = g_PatchTable.find(FunctionName);
+
+	// The DirectSound patch table is inconsistent about the leading letter: streams
+	// are registered under BOTH CDirectSoundStream_* (38 entries) and
+	// IDirectSoundStream_* (10), but buffers ONLY under IDirectSoundBuffer_* (46,
+	// with zero C-prefixed entries). Our symbols come from the title's own PDB,
+	// which names them after the implementation CLASS - CDirectSoundBuffer_Play -
+	// so on this title every stream symbol bound and every buffer symbol did not.
+	//
+	// The visible result was music playing while no sound effect ever did: music is
+	// streamed through CDirectSoundStream_*, whereas effects are in-memory buffers
+	// and CDirectSoundBuffer_Play - the call that actually starts one - ran
+	// unpatched. Half the buffer API was in that state (25 patched, 25 not).
+	//
+	// C and I name the same function here: CDirectSoundBuffer is the class that
+	// implements the IDirectSoundBuffer interface, so the entry point is identical.
+	// Retry a leading 'C' as 'I' rather than duplicating 46 table entries that would
+	// then have to be kept in sync.
+	// Our symbols come from the title's own PDB, which names functions after the
+	// implementation CLASS (CDirectSoundBuffer_Play). Cxbx registers sound STREAMS
+	// under both prefixes - CDirectSoundStream_* (38 entries) and
+	// IDirectSoundStream_* (10) - but BUFFERS only under the interface name
+	// (IDirectSoundBuffer_*, 46 entries, zero C-prefixed). So every stream symbol
+	// bound and every buffer symbol silently did not, which is exactly what was
+	// audible: music is streamed, sound effects are in-memory buffers, and
+	// CDirectSoundBuffer_Play - the call that starts one - ran unpatched. Half the
+	// buffer API was in that state (25 patched, 25 not).
+	//
+	// C and I name the same function: CDirectSoundBuffer is the class implementing
+	// the IDirectSoundBuffer interface, so the entry point is identical. Retry a
+	// leading 'C' as 'I' rather than duplicating 46 table entries to keep in sync.
+	//
+	// HISTORY: this was reverted once for causing a rendering regression. It did not
+	// cause it - a poisoned EmuDisk did, and no code change could have fixed that.
+	// The revert was a misattribution; see BETA_REPORT.md. If rendering does break
+	// again with this on, clear ShaderCache\ and EmuDisk\ BEFORE blaming this code.
+	if (it == g_PatchTable.end() && FunctionName.rfind("CDirectSound", 0) == 0) {
+		std::string InterfaceName = FunctionName;
+		InterfaceName[0] = 'I';
+		it = g_PatchTable.find(InterfaceName);
+		if (it != g_PatchTable.end()) {
+			printf("HLE: %s -> %s (class name mapped to interface name)\n",
+				FunctionName.c_str(), InterfaceName.c_str());
+		}
+	}
+
 	if (it == g_PatchTable.end()) {
 		// A symbol was located in the title but there is no patch registered under
 		// that exact name. This used to return silently, which made a whole class of

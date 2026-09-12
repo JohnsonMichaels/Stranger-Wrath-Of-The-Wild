@@ -198,6 +198,74 @@ void BuildShader(IntermediateVertexShader* pShader, std::stringstream& hlsl)
 		hlsl << ");";
 	};
 
+	// Xbox temporary register index a destination writes to (oPos and r12 are the same register)
+	auto DestTempIndex = [](const VSH_IMD_DEST& dest) -> int {
+		if (dest.Type == IMD_DEST_R) return dest.Address;
+		if (dest.Type == IMD_DEST_O && dest.Address == 0 /*oPos*/) return 12;
+		return -1;
+	};
+
+	// True when writing 'dest' would overwrite a component that one of 'params' reads back
+	auto DestAliasesParams = [&](const VSH_IMD_DEST& dest, const VSH_IMD_PARAMETER* params, int paramCount) -> bool {
+		const int destTemp = DestTempIndex(dest);
+		if (destTemp < 0 || dest.Mask == 0) return false;
+
+		for (int p = 0; p < paramCount; p++) {
+			const VSH_IMD_PARAMETER& prm = params[p];
+			if (prm.Type != PARAM_R || prm.Address != destTemp) continue;
+			for (int s = 0; s < 4; s++) {
+				if ((dest.Mask & MASK_X && prm.Swizzle[s] == SWIZZLE_X) ||
+					(dest.Mask & MASK_Y && prm.Swizzle[s] == SWIZZLE_Y) ||
+					(dest.Mask & MASK_Z && prm.Swizzle[s] == SWIZZLE_Z) ||
+					(dest.Mask & MASK_W && prm.Swizzle[s] == SWIZZLE_W)) {
+					return true;
+				}
+			}
+		}
+
+		return false;
+	};
+
+	// A single Xbox instruction writes ONE computed result to both a temporary register
+	// and an output register. Emitting the operation twice (once per destination) is only
+	// equivalent while none of its inputs alias the temporary register it just wrote.
+	// When they do, compute the result once into macTemp and distribute it instead.
+	// Test case : Oddworld Stranger's Wrath (skinned characters) - the second bone of
+	// "mad rN.xyzw / oTn.xyz, v1.w, c[a0.x], rN" was applied twice to the output register,
+	// so positions skinned correctly while the matrix used to shade them did not.
+	bool macTempDeclared = false;
+	auto WriteOpToBothDests = [&](
+		const std::string& opcode,
+		VSH_IMD_DEST tempDest, VSH_IMD_DEST oRegDest,
+		int paramCount, VSH_IMD_PARAMETER* params,
+		bool indexesWithA0_X,
+		bool useTempParam
+	) {
+		if (!macTempDeclared) {
+			hlsl << "\n  float4 macTemp;";
+			macTempDeclared = true;
+		}
+
+		// Compute the result once, at full width
+		hlsl << "\n  " << opcode << "(macTemp,xyzw";
+		for (int i = 0; i < paramCount; i++) {
+			hlsl << ", ";
+			ParameterHlsl(hlsl, params[i], indexesWithA0_X, useTempParam);
+		}
+		hlsl << ");";
+
+		// Then distribute it to both destinations, each with its own write mask
+		hlsl << "\n  x_mov(";
+		DestRegisterHlsl(hlsl, tempDest);
+		DestMaskHlsl(hlsl, tempDest);
+		hlsl << ", macTemp);";
+
+		hlsl << "\n  x_mov(";
+		DestRegisterHlsl(hlsl, oRegDest);
+		DestMaskHlsl(hlsl, oRegDest);
+		hlsl << ", macTemp);";
+	};
+
 	for (size_t i = 0; i < pShader->Instructions.size(); i++) {
 		VSH_IMD_INSTR& in = pShader->Instructions[i];
 
@@ -259,21 +327,42 @@ void BuildShader(IntermediateVertexShader* pShader, std::stringstream& hlsl)
 
 		// Write MAC op
 		if (in.MAC.Opcode != MAC_NOP) {
-			if (in.MAC.Dest.Mask) {
-				WriteOp(VSH_MAC_HLSL[in.MAC.Opcode], in.MAC.Dest, in.MAC.ParamCount, in.MAC.Parameters, in.IndexesWithA0_X, false);
+			const bool macToTemp = in.MAC.Dest.Mask != 0;
+			const bool macToOReg = (in.ORegSource == SRC_MAC) && (in.ORegDest.Mask != 0);
+
+			if (macToTemp && macToOReg && DestAliasesParams(in.MAC.Dest, in.MAC.Parameters, in.MAC.ParamCount)) {
+				// Both destinations receive the same result, and the temporary register
+				// write would corrupt an input of the output register write - see above
+				LOG_TEST_CASE("Vertex shader MAC writes a temporary register it also reads, plus an output register");
+				WriteOpToBothDests(VSH_MAC_HLSL[in.MAC.Opcode], in.MAC.Dest, in.ORegDest, in.MAC.ParamCount, in.MAC.Parameters, in.IndexesWithA0_X, false);
 			}
-			if (in.ORegSource == SRC_MAC && in.ORegDest.Mask) {
-				WriteOp(VSH_MAC_HLSL[in.MAC.Opcode], in.ORegDest, in.MAC.ParamCount, in.MAC.Parameters, in.IndexesWithA0_X, false);
+			else {
+				if (macToTemp) {
+					WriteOp(VSH_MAC_HLSL[in.MAC.Opcode], in.MAC.Dest, in.MAC.ParamCount, in.MAC.Parameters, in.IndexesWithA0_X, false);
+				}
+				if (macToOReg) {
+					WriteOp(VSH_MAC_HLSL[in.MAC.Opcode], in.ORegDest, in.MAC.ParamCount, in.MAC.Parameters, in.IndexesWithA0_X, false);
+				}
 			}
 		}
 
 		// Write ILU op
 		if (in.ILU.Opcode != ILU_NOP) {
-			if (in.ILU.Dest.Mask) {
-				WriteOp(VSH_ILU_HLSL[in.ILU.Opcode], in.ILU.Dest, 1, &in.ILU.Parameter, in.IndexesWithA0_X, iluTemp);
+			const bool iluToTemp = in.ILU.Dest.Mask != 0;
+			const bool iluToOReg = (in.ORegSource == SRC_ILU) && (in.ORegDest.Mask != 0);
+
+			// Note : when iluTemp is set, both writes read a snapshot instead, so there is no hazard
+			if (iluToTemp && iluToOReg && !iluTemp && DestAliasesParams(in.ILU.Dest, &in.ILU.Parameter, 1)) {
+				LOG_TEST_CASE("Vertex shader ILU writes a temporary register it also reads, plus an output register");
+				WriteOpToBothDests(VSH_ILU_HLSL[in.ILU.Opcode], in.ILU.Dest, in.ORegDest, 1, &in.ILU.Parameter, in.IndexesWithA0_X, false);
 			}
-			if (in.ORegSource == SRC_ILU && in.ORegDest.Mask) {
-				WriteOp(VSH_ILU_HLSL[in.ILU.Opcode], in.ORegDest, 1, &in.ILU.Parameter, in.IndexesWithA0_X, iluTemp);
+			else {
+				if (iluToTemp) {
+					WriteOp(VSH_ILU_HLSL[in.ILU.Opcode], in.ILU.Dest, 1, &in.ILU.Parameter, in.IndexesWithA0_X, iluTemp);
+				}
+				if (iluToOReg) {
+					WriteOp(VSH_ILU_HLSL[in.ILU.Opcode], in.ORegDest, 1, &in.ILU.Parameter, in.IndexesWithA0_X, iluTemp);
+				}
 			}
 		}
 

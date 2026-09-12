@@ -449,6 +449,35 @@ FILE* CxbxrKrnlSetupVerboseLog(int BootFlags)
 			return krnlLog;
 		}
 		else {
+			// DebugMode is NONE - which is what a SHIPPED build runs with.
+			//
+			// This used to send stdout to "nul", silently discarding every printf in
+			// the emulator. In a build with logging off that is *every* diagnostic
+			// there is: RENDERSTATS, the opened-file census, the input binding
+			// report, the unhandled-exception location. It also runs AFTER the
+			// redirect set up in Emulate(), so it quietly undid that too - the
+			// diagnostics file was created, received its header, and then went empty.
+			//
+			// Point it at a small file beside the emulator instead. Users never look
+			// at it, it costs a few KB, and it is the difference between a standalone
+			// build that can be diagnosed and one that cannot. Line-buffered so a
+			// crash still leaves the run-up on disk.
+			char szDiagPath[MAX_PATH] = {};
+			HMODULE hSelf = nullptr;
+			if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+					(LPCSTR)&PrintCurrentConfigurationLog, &hSelf)
+			 && GetModuleFileNameA(hSelf, szDiagPath, MAX_PATH) > 0) {
+				char *pSlash = strrchr(szDiagPath, '\\');
+				if (pSlash != nullptr) {
+					strcpy_s(pSlash + 1, MAX_PATH - (size_t)(pSlash + 1 - szDiagPath), "diagnostics.txt");
+					FILE *pDiag = freopen(szDiagPath, "wt", stdout);
+					if (pDiag != nullptr) {
+						setvbuf(stdout, nullptr, _IOLBF, 4096);
+						return pDiag;
+					}
+				}
+			}
+			// Only if that failed do we fall back to discarding output.
 			char buffer[16];
 			if (GetConsoleTitle(buffer, 16) != NULL)
 				(void)freopen("nul", "w", stdout);
@@ -720,6 +749,63 @@ static bool CxbxrKrnlXbeSystemSelector(int BootFlags,
 
 	CxbxrKrnlSetupMemorySystem(BootFlags, emulate_system, reserved_systems, blocks_reserved);
 	return true;
+}
+
+// Title patch: Oddworld: Stranger's Wrath, 2004-05 devkit beta.
+//
+// The engine serves every allocation of <= 256 bytes from SmallAllocator_FixedRestoring,
+// a FIXED arena of 1024 4 KB pages built once by its initialiser and never grown.
+// Mongo Valley (region_03) runs it dry while deserialising its object graph,
+// the engine asserts "Good Lord! Out of Pages in SmallAllocator_FixedRestoring!"
+// and parks in its halt handler - a black screen that looks exactly like a hang.
+// (Gizzard Gulch is larger on every axis and loads fine: it is the object graph's
+// shape, not the level's size.)
+//
+// The arena is defined by four immediates in the one initialiser. They are rewritten
+// here, in guest memory, after the sections are loaded: the XBE on disk is never
+// touched, which matters because recipients supply their own copy of the beta. The
+// fingerprint is the opcode bytes AND the stock immediates at four exact addresses,
+// so any other XBE - or an already-enlarged file - is left alone.
+static void CxbxrKrnlApplyTitlePatches()
+{
+	struct Site { xbox::addr_xt Opcode; const char *Bytes; unsigned OpcodeLen; xbox::addr_xt Imm; uint32_t Stock; uint32_t Patched; const char *What; };
+	static const Site Sites[] = {
+		{ 0x00142EC7, "\x68",     1, 0x00142EC8, 0x00400000, 0x01000000, "push <arena size>" },
+		{ 0x00142ED4, "\x8D\x88", 2, 0x00142ED6, 0x00400000, 0x01000000, "lea ecx,[eax+<arena size>]" },
+		{ 0x00142EF1, "\x81\xF9", 2, 0x00142EF3, 0x000003FF, 0x00000FFF, "cmp ecx,<last page>" },
+		{ 0x00142F10, "\x81\xF9", 2, 0x00142F12, 0x00000400, 0x00001000, "cmp ecx,<page count>" },
+	};
+	const size_t Count = sizeof(Sites) / sizeof(Sites[0]);
+
+	// Every site must be readable and match either the stock or the already-patched
+	// value, with the right opcode in front of it. Anything else is not this title.
+	unsigned Stock = 0, Already = 0;
+	for (size_t i = 0; i < Count; ++i) {
+		if (IsBadReadPtr((const void *)(uintptr_t)Sites[i].Opcode, Sites[i].OpcodeLen + 4 + 4)) {
+			return;
+		}
+		if (memcmp((const void *)(uintptr_t)Sites[i].Opcode, Sites[i].Bytes, Sites[i].OpcodeLen) != 0) {
+			return;
+		}
+		uint32_t Value;
+		memcpy(&Value, (const void *)(uintptr_t)Sites[i].Imm, sizeof(Value));
+		if (Value == Sites[i].Stock) { ++Stock; }
+		else if (Value == Sites[i].Patched) { ++Already; }
+		else { return; }
+	}
+	if (Already == Count) {
+		printf("TITLEPATCH: SmallAllocator arena already 4096 pages / 16 MB in this XBE - nothing to do" "\n");
+		return;
+	}
+	if (Stock != Count) {
+		printf("TITLEPATCH: SmallAllocator arena sites are inconsistent (%u stock, %u patched) - left untouched" "\n", Stock, Already);
+		return;
+	}
+	for (size_t i = 0; i < Count; ++i) {
+		memcpy((void *)(uintptr_t)Sites[i].Imm, &Sites[i].Patched, sizeof(uint32_t));
+	}
+	printf("TITLEPATCH: SmallAllocator arena enlarged in memory, 1024 -> 4096 pages (4 -> 16 MB); the stock 1024 run dry loading Mongo Valley" "\n");
+	fflush(stdout);
 }
 
 // HACK: Attempt to patch out XBE header reads
@@ -1014,6 +1100,7 @@ void CxbxKrnlEmulate(unsigned int reserved_systems, blocks_reserved_t blocks_res
 	RestoreExeImageHeader();
 
 	CxbxrKrnlXbePatchXBEHSig();
+	CxbxrKrnlApplyTitlePatches();
 
 	// Launch the XBE :
 	{

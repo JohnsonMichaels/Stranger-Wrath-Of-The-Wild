@@ -380,6 +380,15 @@ XBSYSAPI EXPORTNUM(255) xbox::ntstatus_xt NTAPI xbox::PsCreateSystemThreadEx
 			RETURN(result);
 		}
 
+		// A loader thread waiting on a worker that never exits looks exactly like a
+		// wait on a dead event, so record the start routine: it names the worker.
+		{
+			char Origin[80];
+			std::snprintf(Origin, sizeof(Origin), "PsCreateSystemThreadEx(start=0x%08X)",
+				(unsigned)(uintptr_t)StartRoutine);
+			CxbxrNoteHandleOrigin((void *)*ThreadHandle, Origin);
+		}
+
 		if (ThreadId != zeroptr) {
 			*ThreadId = eThread->UniqueThread;
 		}
@@ -397,6 +406,14 @@ XBSYSAPI EXPORTNUM(255) xbox::ntstatus_xt NTAPI xbox::PsCreateSystemThreadEx
 			ObfDereferenceObject(eThread);
 			RETURN(X_STATUS_INSUFFICIENT_RESOURCES);
 		}
+
+		// Tie the host thread id to the guest routine it runs. When a thread dies and
+		// something else waits on it forever, the start address is what names it -
+		// the PDB turns it straight into an engine function.
+		printf("THREADSTART: tid=%u start=0x%08X context=0x%08X\n",
+			ThreadId, (unsigned)(uintptr_t)StartRoutine, (unsigned)(uintptr_t)StartContext);
+		fflush(stdout);
+		CxbxrNoteThreadStarted(ThreadId, (unsigned)(uintptr_t)StartRoutine, (unsigned)(uintptr_t)StartContext);
 
 		// Increment the ref count of the thread once more. This is to guard against the case the title closes the thread handle
 		// before this thread terminates with PsTerminateSystemThread
@@ -490,6 +507,12 @@ XBSYSAPI EXPORTNUM(258) xbox::void_xt NTAPI xbox::PsTerminateSystemThread
 )
 {
 	LOG_FUNC_ONE_ARG(ExitStatus);
+
+	// A thread that quits while another waits on it is exactly the shape of the
+	// level-load wedge, so record every exit.
+	printf("THREADEXIT: tid=%u status=0x%08X\n", (unsigned)GetCurrentThreadId(), (unsigned)ExitStatus);
+	fflush(stdout);
+	CxbxrNoteThreadExited((unsigned)GetCurrentThreadId(), (unsigned)ExitStatus);
 
 	xbox::PETHREAD eThread = xbox::PspGetCurrentThread();
 	eThread->Tcb.HasTerminated = 1;

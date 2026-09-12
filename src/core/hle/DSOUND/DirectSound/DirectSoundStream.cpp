@@ -38,6 +38,8 @@
 #include "..\XbDSoundLogging.hpp"
 
 #include "DSStream_PacketManager.hpp"
+#include "DirectSound3DVoice.hpp" // Cxbxr3DVoiceState: the 3D voice data XACT hands a voice (DS3D resolve, Part A)
+#include <cstdio> // printf: the bounded DS3D stream trace below (EmuLog is off in the shipped configuration)
 
 // TODO: Tasks need to do for DirectSound HLE
 // * Missing CDirectSoundStream patch
@@ -117,6 +119,90 @@ xbox::X_CDirectSoundStream::X_CDirectSoundStream(bool is3D) : Xb_Voice(is3D)
  */
 
 #include "DirectSoundInline.hpp"
+
+// ******************************************************************
+// * 3D voice data on streams (DS3D resolve, Part C)
+// ******************************************************************
+// XACT drives positional sound with the Xbox's own 3D calculator and hands the result
+// to the voice through Set3DVoiceData. A streamed wave (this class) routed into a 3D
+// sound source with SetOutputBuffer receives its own distance/cone/I3DL2/doppler
+// values; its placement (the azimuth) is delivered to the PARENT mixin buffer instead,
+// which Part A records in that buffer's Xb_3D. Host DirectSound cannot chain buffers,
+// so the parent's pan is applied to this stream directly.
+//
+// Streams are the music path and work today, so every path below is a no-op until 3D
+// data is actually in use: Cxbxr3DVoice_VolumeOffsetMb/PanMb/PitchDelta return 0 while
+// Xb_3D.bUse is false (no Use3DVoiceData(TRUE) yet), and the re-apply helper returns
+// early on the same flag. A stream that never gets 3D data never changes behaviour.
+
+static constexpr DWORD CXBXR_STREAM3D_VOLUME = 1 << 0;
+static constexpr DWORD CXBXR_STREAM3D_PAN    = 1 << 1;
+static constexpr DWORD CXBXR_STREAM3D_PITCH  = 1 << 2;
+static constexpr DWORD CXBXR_STREAM3D_ALL    = CXBXR_STREAM3D_VOLUME | CXBXR_STREAM3D_PAN | CXBXR_STREAM3D_PITCH;
+
+// The hybrid buffer this stream was routed into, if it is still alive. Looked up in
+// g_pDSoundBufferCache rather than dereferenced blindly: nothing clears Xb_OutputParent
+// when the parent is released.
+static xbox::EmuDirectSoundBuffer* CxbxrStream3D_Parent(xbox::X_CDirectSoundStream* pThis)
+{
+    xbox::XbHybridDSBuffer* pParent = pThis->Xb_OutputParent;
+    if (pParent == nullptr) {
+        return nullptr;
+    }
+    if (std::find(g_pDSoundBufferCache.begin(), g_pDSoundBufferCache.end(), pParent) == g_pDSoundBufferCache.end()) {
+        return nullptr;
+    }
+    return pParent->emuDSBuffer;
+}
+
+// Pan for this stream: its own azimuth if it ever received one (change bit 0x40),
+// otherwise the parent's. XACT masks a routed track's voice data to distance / cone /
+// I3DL2 / doppler (&= 0x33), so in this title the azimuth only ever reaches the parent.
+// 0 = centre, which is also what both sides yield while no 3D data is in use.
+static LONG CxbxrStream3D_PanMb(xbox::X_CDirectSoundStream* pThis, xbox::EmuDirectSoundBuffer* pParent)
+{
+    if (pParent == nullptr || (pThis->Xb_3D.dwHave & 0x40) != 0) {
+        return Cxbxr3DVoice_PanMb(pThis->Xb_3D);
+    }
+    return Cxbxr3DVoice_PanMb(pParent->Xb_3D);
+}
+
+// Push the stream's 3D state to the host object. Volume goes through the same call the
+// title's own SetVolume takes, with the title's volume reconstructed the way the mixbin
+// fold does (the voice stores volume - headroom); pitch likewise on top of the voice's
+// own pitch; pan straight to the host. Callers decide whether to apply: with bUse false
+// the three mapping functions return 0, so applying then CLEARS the 3D terms.
+static void CxbxrStream3D_Apply(xbox::X_CDirectSoundStream* pThis, DWORD dwWhat)
+{
+    if (pThis->EmuDirectSoundBuffer8 == nullptr) {
+        return;
+    }
+    if ((dwWhat & CXBXR_STREAM3D_VOLUME) != 0) {
+        HybridDirectSoundBuffer_SetVolume(pThis->EmuDirectSoundBuffer8,
+                                          pThis->Xb_Voice.GetVolume() + (LONG)pThis->Xb_Voice.GetHeadroom(),
+                                          pThis->EmuFlags, pThis->Xb_VolumeMixbin, &pThis->Xb_Voice,
+                                          Cxbxr3DVoice_VolumeOffsetMb(pThis->Xb_3D));
+    }
+    if ((dwWhat & CXBXR_STREAM3D_PAN) != 0) {
+        HybridDirectSoundBuffer_SetPan3D(pThis->EmuDirectSoundBuffer8, CxbxrStream3D_PanMb(pThis, CxbxrStream3D_Parent(pThis)));
+    }
+    if ((dwWhat & CXBXR_STREAM3D_PITCH) != 0) {
+        HybridDirectSoundBuffer_SetPitch(pThis->EmuDirectSoundBuffer8, pThis->Xb_Voice.GetPitch(), &pThis->Xb_Voice,
+                                         Cxbxr3DVoice_PitchDelta(pThis->Xb_3D));
+    }
+}
+
+// For the title's own SetMixBinVolumes / SetHeadroom / SetFormat / SetOutputBuffer paths,
+// which rewrite the host volume or rebuild the host buffer without the 3D terms: put them
+// back. THE GUARD for the music path: nothing happens unless Use3DVoiceData(TRUE) is in
+// effect on this stream.
+static inline void CxbxrStream3D_Reapply(xbox::X_CDirectSoundStream* pThis, DWORD dwWhat)
+{
+    if (!pThis->Xb_3D.bUse) {
+        return;
+    }
+    CxbxrStream3D_Apply(pThis, dwWhat);
+}
 
 // ******************************************************************
 // * patch: DirectSoundDoWork (stream)
@@ -264,6 +350,12 @@ xbox::hresult_xt WINAPI xbox::EMUPATCH(DirectSoundCreateStream)
 
         DSoundBufferSetDefault((*ppStream), DSBPLAY_LOOPING, pdssd->dwFlags);
         (*ppStream)->Xb_rtFlushEx = 0LL;
+        // 3D voice data starts absent: no volume offset, no pan, no pitch delta, no parent
+        // (the Cxbxr3DVoice_* mapping functions return 0 while bUse is false). Part B's
+        // DSoundBufferSetDefault initialises the same two members; repeating it here keeps
+        // the music path's no-op guarantee independent of that macro.
+        Cxbxr3DVoice_Init((*ppStream)->Xb_3D);
+        (*ppStream)->Xb_OutputParent = nullptr;
 
         // We have to set DSBufferDesc last due to EmuFlags must be either 0 or previously written value to preserve other flags.
         GeneratePCMFormat(DSBufferDesc, pdssd->lpwfxFormat, (DWORD &)pdssd->dwFlags, (*ppStream)->EmuFlags, 0,
@@ -1010,6 +1102,9 @@ xbox::hresult_xt WINAPI xbox::EMUPATCH(CDirectSoundStream_SetFormat)
                                                      pThis->X_BufferCacheSize, pThis->Xb_VoiceProperties,
                                                      xbox::zeroptr, &pThis->Xb_Voice);
 
+    // SetFormat may rebuild the host buffer; nothing to redo unless 3D data is in use.
+    CxbxrStream3D_Reapply(pThis, CXBXR_STREAM3D_ALL);
+
     return hRet;
 }
 
@@ -1065,6 +1160,9 @@ xbox::hresult_xt WINAPI xbox::EMUPATCH(CDirectSoundStream_SetHeadroom)
 
     HRESULT hRet = HybridDirectSoundBuffer_SetHeadroom(pThis->EmuDirectSoundBuffer8, dwHeadroom,
                                                        pThis->Xb_VolumeMixbin, pThis->EmuFlags, &pThis->Xb_Voice);
+
+    // SetHeadroom rewrites the host volume with no 3D term; nothing to redo unless 3D data is in use.
+    CxbxrStream3D_Reapply(pThis, CXBXR_STREAM3D_VOLUME);
 
     return hRet;
 }
@@ -1275,6 +1373,9 @@ xbox::hresult_xt WINAPI xbox::EMUPATCH(CDirectSoundStream_SetMixBinVolumes_12)
     HRESULT hRet = HybridDirectSoundBuffer_SetMixBinVolumes_12(pThis->EmuDirectSoundBuffer8, dwMixBinMask, alVolumes, pThis->Xb_VoiceProperties,
                                                               pThis->EmuFlags, pThis->Xb_VolumeMixbin, &pThis->Xb_Voice);
 
+    // The fold's own SetVolume carries no 3D term; nothing to redo unless 3D data is in use.
+    CxbxrStream3D_Reapply(pThis, CXBXR_STREAM3D_VOLUME);
+
     return hRet;
 }
 
@@ -1297,6 +1398,9 @@ xbox::hresult_xt WINAPI xbox::EMUPATCH(CDirectSoundStream_SetMixBinVolumes_8)
     HRESULT hRet = HybridDirectSoundBuffer_SetMixBinVolumes_8(pThis->EmuDirectSoundBuffer8, pMixBins, pThis->Xb_VoiceProperties,
                                                               pThis->EmuFlags, pThis->Xb_VolumeMixbin, &pThis->Xb_Voice);
 
+    // The fold's own SetVolume carries no 3D term; nothing to redo unless 3D data is in use.
+    CxbxrStream3D_Reapply(pThis, CXBXR_STREAM3D_VOLUME);
+
     return hRet;
 }
 
@@ -1315,11 +1419,25 @@ xbox::hresult_xt WINAPI xbox::EMUPATCH(CDirectSoundStream_SetOutputBuffer)
 		LOG_FUNC_ARG(pOutputBuffer)
 		LOG_FUNC_END;
 
-    // NOTE: SetOutputBuffer is not possible in PC's DirectSound due to 3D controller requirement on ouput buffer to work simultaneously.
-    // Test case: Red Faction 2
-    // Best to emulate this LLE instead of HLE.
+    // On the Xbox this routes the stream's dry signal into pOutputBuffer, a MIXIN buffer
+    // owned by an XACT 3D sound source whose placement the 3D calculator drives (NULL
+    // unroutes). Host DirectSound cannot chain buffers, so the submix itself is still not
+    // emulated - the stream keeps playing directly, exactly as before - but the routing is
+    // recorded so the parent's pan can be applied to this stream (CxbxrStream3D_PanMb).
+    // Upstream test case for the routing itself: Red Faction 2.
+    pThis->Xb_OutputParent = pOutputBuffer;
 
-    LOG_NOT_SUPPORTED();
+    { // DS3D trace, bounded (see IDirectSoundStream_Set3DVoiceData)
+        static unsigned s_Seen = 0;
+        if (++s_Seen <= 40) {
+            printf("DS3D: stream %p SetOutputBuffer parent=%p use=%d\n",
+                (void *)pThis, (void *)pOutputBuffer, (int)pThis->Xb_3D.bUse);
+            fflush(stdout);
+        }
+    }
+
+    // The pan source changed; nothing to redo unless 3D data is in use on this stream.
+    CxbxrStream3D_Reapply(pThis, CXBXR_STREAM3D_PAN);
 
     return S_OK;
 }
@@ -1339,7 +1457,8 @@ xbox::hresult_xt WINAPI xbox::EMUPATCH(CDirectSoundStream_SetPitch)
         LOG_FUNC_ARG(lPitch)
         LOG_FUNC_END;
 
-    HRESULT hRet = HybridDirectSoundBuffer_SetPitch(pThis->EmuDirectSoundBuffer8, lPitch, &pThis->Xb_Voice);
+    HRESULT hRet = HybridDirectSoundBuffer_SetPitch(pThis->EmuDirectSoundBuffer8, lPitch, &pThis->Xb_Voice,
+                                                    Cxbxr3DVoice_PitchDelta(pThis->Xb_3D)); // doppler; 0 unless 3D data is in use
 
     return hRet;
 }
@@ -1475,7 +1594,8 @@ xbox::hresult_xt WINAPI xbox::EMUPATCH(CDirectSoundStream_SetVolume)
 		LOG_FUNC_END;
 
     HRESULT hRet = HybridDirectSoundBuffer_SetVolume(pThis->EmuDirectSoundBuffer8, lVolume, pThis->EmuFlags,
-                                                     pThis->Xb_VolumeMixbin, &pThis->Xb_Voice);
+                                                     pThis->Xb_VolumeMixbin, &pThis->Xb_Voice,
+                                                     Cxbxr3DVoice_VolumeOffsetMb(pThis->Xb_3D)); // 0 unless 3D data is in use
 
     return hRet;
 }
@@ -1512,13 +1632,57 @@ xbox::hresult_xt WINAPI xbox::EMUPATCH(IDirectSoundStream_Set3DVoiceData)
         LOG_FUNC_ARG(a2)
         LOG_FUNC_END;
 
-    LOG_UNIMPLEMENTED();
+    // a2 is the X_DS3DCALCVOICEDATA* that XACT fills from the 3D calculator: 0x38 bytes,
+    // dwChangeMask first, one bit per field, set only when that field changed
+    // (DS3D_CALCULATOR_CONTRACT.md 2.4). The patch is stdcall (this, pVoiceData), verified;
+    // the declared signature is kept and the argument is reinterpreted here.
+    const xbox::X_DS3DCALCVOICEDATA* pVoiceData = reinterpret_cast<const xbox::X_DS3DCALCVOICEDATA*>(static_cast<uintptr_t>(a2));
+    if (pVoiceData == nullptr || IsBadReadPtr(pVoiceData, sizeof(xbox::X_DS3DCALCVOICEDATA))) {
+        LOG_TEST_CASE("IDirectSoundStream_Set3DVoiceData with an unreadable voice data pointer");
+        RETURN(X_STATUS_SUCCESS);
+    }
+    const DWORD dwChangeMask = *reinterpret_cast<const uint32_t*>(pVoiceData); // +0, read as the Xbox code reads it
+
+    // Copy exactly the fields whose bits are set, as CDirectSoundVoice::Set3DVoiceData does.
+    Cxbxr3DVoice_Merge(pThis->Xb_3D, pVoiceData);
+
+    xbox::EmuDirectSoundBuffer* pParent = CxbxrStream3D_Parent(pThis);
+    const LONG lVolume3DMb = Cxbxr3DVoice_VolumeOffsetMb(pThis->Xb_3D);
+    const LONG lPanMb = CxbxrStream3D_PanMb(pThis, pParent);
+    const LONG lPitchDelta = Cxbxr3DVoice_PitchDelta(pThis->Xb_3D);
+
+    // DS3D stream trace, bounded: what arrived, what the merged state holds, what the host
+    // gets. printf because EmuLog is off in this build; tools/ds3d_trail.py reads it.
+    {
+        static unsigned s_Seen = 0;
+        if (++s_Seen <= 40) {
+            printf("DS3D: stream %p Set3DVoiceData mask=0x%02X parent=%p use=%d dist=%ld cone=%ld direct=%ld reverb=%ld doppler=%ld az=%.1f have=0x%02X -> vol3d=%ld pan=%ld pitch=%ld\n",
+                (void *)pThis, (unsigned)dwChangeMask, (void *)pThis->Xb_OutputParent, (int)pThis->Xb_3D.bUse,
+                (long)pThis->Xb_3D.lDistanceVolume, (long)pThis->Xb_3D.lConeVolume, (long)pThis->Xb_3D.lDirectVolume,
+                (long)pThis->Xb_3D.lReverbVolume, (long)pThis->Xb_3D.lDopplerPitch, (double)pThis->Xb_3D.flAzimuth,
+                (unsigned)pThis->Xb_3D.dwHave, (long)lVolume3DMb, (long)lPanMb, (long)lPitchDelta);
+            fflush(stdout);
+        }
+    }
+
+    // Apply only while Use3DVoiceData(TRUE) is in effect: the Xbox copies the data
+    // regardless and gates its use on that flag (ConvertVolumeValues / ConvertPitchValue).
+    if (pThis->Xb_3D.bUse) {
+        DWORD dwWhat = CXBXR_STREAM3D_PAN;                // the parent may have moved: its pan is pulled on every update
+        if ((dwChangeMask & (0x01 | 0x02 | 0x10)) != 0) { // distance, cone, I3DL2 direct/reverb
+            dwWhat |= CXBXR_STREAM3D_VOLUME;
+        }
+        if ((dwChangeMask & 0x20) != 0) {                 // doppler
+            dwWhat |= CXBXR_STREAM3D_PITCH;
+        }
+        CxbxrStream3D_Apply(pThis, dwWhat);
+    }
 
     RETURN(X_STATUS_SUCCESS);
 }
 
 // ******************************************************************
-// * patch:  IDirectSoundBuffer_Use3DVoiceData
+// * patch:  IDirectSoundStream_Use3DVoiceData
 // ******************************************************************
 xbox::hresult_xt WINAPI xbox::EMUPATCH(IDirectSoundStream_Use3DVoiceData)
 (
@@ -1533,7 +1697,29 @@ xbox::hresult_xt WINAPI xbox::EMUPATCH(IDirectSoundStream_Use3DVoiceData)
         LOG_FUNC_ARG(a2)
         LOG_FUNC_END;
 
-    LOG_UNIMPLEMENTED();
+    // a2 is BOOL fUse (stdcall, verified). XACT calls this on every routing change with
+    // TRUE iff this voice or its new parent is 3D; on the Xbox it only toggles the flag
+    // that ConvertVolumeValues / ConvertPitchValue test before using the voice data.
+    // Music streams start FALSE and receive FALSE, so nothing below runs for them.
+    const bool bUse = (a2 != 0);
+    const bool bWasInUse = pThis->Xb_3D.bUse;
+    pThis->Xb_3D.bUse = bUse;
+
+    { // DS3D trace, bounded (see IDirectSoundStream_Set3DVoiceData)
+        static unsigned s_Seen = 0;
+        if (++s_Seen <= 40) {
+            printf("DS3D: stream %p Use3DVoiceData use=%d was=%d parent=%p\n",
+                (void *)pThis, (int)bUse, (int)bWasInUse, (void *)pThis->Xb_OutputParent);
+            fflush(stdout);
+        }
+    }
+
+    if (bUse != bWasInUse) {
+        // Turning on applies whatever has been received so far; turning off applies the
+        // zeros the mapping functions now return - plain voice volume and pitch, centre
+        // pan: the state a stream that never had 3D data is in.
+        CxbxrStream3D_Apply(pThis, CXBXR_STREAM3D_ALL);
+    }
 
     RETURN(X_STATUS_SUCCESS);
 }
